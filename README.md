@@ -29,7 +29,7 @@
 
 ```
 ┌───────────────────────────────────────────────────────────────────────────┐
-│ ⚡ zchat.zsh v1.0.0 │ Model: gemma4:12b (localhost:11434)     [ Ready ]    │
+│ ⚡ zchat.zsh v1.0.0 │ Model: gemma4:12b (localhost:11434)     [ Ready ]   │
 ├───────────────┬───────────────────────────────────────────────────────────┤
 │ Sessions (3)  │  Chat Transcript (4 msgs)                                 │
 │ ▶ Hello World │  🧑 You  11:00                                            │
@@ -256,4 +256,4 @@ Session fields and message bodies are stored as raw files inside each session di
 
 ## 📄 License
 
-MIT License — feel free to explore, hack on, and extend this ZSH experiment!
+Apache-2.0 License — feel free to explore, hack on, and extend this ZSH experiment!
