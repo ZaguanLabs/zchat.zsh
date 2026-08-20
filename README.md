@@ -4,11 +4,34 @@
 
 ---
 
+## 🚀 Quick Start
+
+With [Ollama](https://ollama.com/) installed and running:
+
+```bash
+ollama pull gemma4:12b
+git clone https://github.com/ZaguanLabs/zchat.zsh.git
+cd zchat.zsh
+./zchat.zsh
+```
+
+Start typing and press `Enter` to chat. Press `Ctrl+Q` to quit.
+
+To use another installed model or a remote Ollama server:
+
+```bash
+./zchat.zsh --model MODEL_NAME --host HOST:11434
+```
+
+See [System Requirements & Prerequisites](#-system-requirements--prerequisites) if Zsh reports a missing module.
+
+---
+
 ## 📖 Table of Contents
 
+- [Quick Start](#-quick-start)
 - [Overview](#-overview)
 - [System Requirements & Prerequisites](#-system-requirements--prerequisites)
-- [Quick Start](#-quick-start)
 - [Key Features](#-key-features)
   - [Live Reasoning & Auto-Collapsing](#1-live-reasoning--auto-collapsing)
   - [Terminal Markdown & Syntax Engine](#2-terminal-markdown--syntax-engine)
@@ -84,33 +107,6 @@ sudo dnf install zsh
 ```bash
 brew install zsh
 ```
-
----
-
-## 🚀 Quick Start
-
-1. **Clone or Navigate to the Project:**
-   ```bash
-   git clone https://github.com/your-username/chat.sh.git
-   cd chat.sh
-   ```
-
-2. **Make Executable:**
-   ```bash
-   chmod +x zchat.zsh chat.sh
-   ```
-
-3. **Launch with Default Host (`localhost:11434`):**
-   ```bash
-   ./zchat.zsh
-   # or
-   ./chat.sh
-   ```
-
-4. **Launch with Custom Ollama Host or Model:**
-   ```bash
-   ./zchat.zsh --host localhost:11434 --model gemma4:12b
-   ```
 
 ---
 
