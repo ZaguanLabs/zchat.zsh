@@ -11,7 +11,7 @@ zmodload zsh/curses zsh/datetime zsh/files zsh/mapfile zsh/net/tcp \
 }
 
 typeset -gr ZCHAT_NAME="zchat.zsh"
-typeset -gr ZCHAT_VERSION="1.0.0"
+typeset -gr ZCHAT_VERSION="1.0.1"
 typeset -gr ZCHAT_DEFAULT_OLLAMA_HOST="localhost:11434"
 typeset -g ZCHAT_HOST_OVERRIDE=0
 [[ -n "${OLLAMA_HOST:-}" ]] && ZCHAT_HOST_OVERRIDE=1
@@ -86,12 +86,6 @@ cleanup() {
 }
 trap cleanup EXIT INT TERM HUP
 
-# Resize signal handler
-TRAPWINCH() {
-  ui_setup_windows
-  ui_refresh_all 0
-}
-
 # Main Application Initialization
 main() {
   state_init
@@ -113,6 +107,8 @@ main() {
   local curr_idx=1 i=1
 
   while (( RUNNING )); do
+    ui_poll_resize
+
     # --------------------------------------------------------------------------
     # 1. Handle Active Background Streaming (Reasoning + Content)
     # --------------------------------------------------------------------------

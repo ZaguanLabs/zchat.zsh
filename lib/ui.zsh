@@ -7,6 +7,8 @@ typeset -g TOP_H=3
 typeset -g SIDE_W=24
 typeset -g INPUT_H=4
 typeset -g FOOT_H=1
+typeset -gF UI_NEXT_RESIZE_CHECK=0.0
+typeset -grF UI_RESIZE_CHECK_INTERVAL=0.25
 
 # Focus management: 'input', 'sidebar', 'chat'
 typeset -g FOCUS_PANE="input"
@@ -67,6 +69,39 @@ ui_setup_windows() {
   zcurses addwin chat_win $main_h $chat_w $top_h $chat_x 2>/dev/null
   zcurses addwin input_win $input_h $SCREEN_W $input_y 0 2>/dev/null
   zcurses addwin foot_win $foot_h $SCREEN_W $foot_y 0 2>/dev/null
+}
+
+# Check the physical terminal dimensions without an external stty dependency.
+ui_poll_resize() {
+  local -F now=$EPOCHREALTIME
+  (( now < UI_NEXT_RESIZE_CHECK )) && return 0
+  UI_NEXT_RESIZE_CHECK=$(( now + UI_RESIZE_CHECK_INTERVAL ))
+
+  # Reloading terminfo makes setupterm query the current TTY dimensions. This
+  # is needed because non-interactive Zsh scripts do not update LINES/COLUMNS
+  # from WINCH while zsh/curses is active.
+  zmodload -u zsh/terminfo 2>/dev/null || return 0
+  zmodload zsh/terminfo 2>/dev/null || return 0
+
+  local new_h="${terminfo[lines]:-0}"
+  local new_w="${terminfo[cols]:-0}"
+  (( new_h > 0 && new_w > 0 )) || return 0
+  (( new_h == SCREEN_H && new_w == SCREEN_W )) && return 0
+
+  ui_resize_windows "$new_h" "$new_w"
+}
+
+# Synchronize curses with the physical terminal, then rebuild and redraw the UI.
+ui_resize_windows() {
+  local new_h="${1:-${terminfo[lines]:-${LINES:-$SCREEN_H}}}"
+  local new_w="${2:-${terminfo[cols]:-${COLUMNS:-$SCREEN_W}}}"
+
+  # endwin makes ncurses re-enter the terminal with the new geometry. Keep the
+  # existing windows intact if this curses build lacks resize_term support.
+  zcurses resize "$new_h" "$new_w" endwin 2>/dev/null || return 1
+
+  ui_setup_windows
+  ui_refresh_all 0
 }
 
 # Destroy all windows
