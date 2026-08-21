@@ -208,7 +208,7 @@ modal_system_prompt() {
 
 # Modal 3: Help / Keybindings
 modal_show_help() {
-  local m_h=17
+  local m_h=20
   local m_w=62
   (( m_h > SCREEN_H - 4 )) && m_h=$(( SCREEN_H - 4 ))
   (( m_w > SCREEN_W - 4 )) && m_w=$(( SCREEN_W - 4 ))
@@ -222,10 +222,13 @@ modal_show_help() {
 
   local -a help_items=(
     "Enter         : Send message"
+    "Shift/Alt+Enter: Insert a prompt newline"
     "Ctrl+R        : Toggle Reasoning expand/collapse"
     "Ctrl+N        : Start a new chat session"
     "Ctrl+O        : Open model picker (switch Ollama model)"
     "/host URL     : Change and save the Ollama URL"
+    "/compact      : Create a conversation checkpoint"
+    "/context      : Show the active context budget"
     "Ctrl+S        : Change system prompt preset"
     "Ctrl+C        : Cancel active streaming / Clear input"
     "Tab           : Switch focus between Chat and Sidebar"

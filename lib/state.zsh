@@ -34,7 +34,9 @@ state_init() {
           OLLAMA_HOST="$REPLY"
         fi
       fi
-      [[ -n "${JSON_CONFIG[default_model]:-}" ]] && SESSION_MODEL="${JSON_CONFIG[default_model]}"
+      if (( ! ZCHAT_MODEL_OVERRIDE )) && [[ -n "${JSON_CONFIG[default_model]:-}" ]]; then
+        SESSION_MODEL="${JSON_CONFIG[default_model]}"
+      fi
       [[ -n "${JSON_CONFIG[system_prompt]:-}" ]] && SESSION_SYSTEM_PROMPT="${JSON_CONFIG[system_prompt]}"
       [[ -n "${JSON_CONFIG[temperature]:-}" ]] && SESSION_TEMPERATURE="${JSON_CONFIG[temperature]}"
     fi
@@ -50,6 +52,9 @@ state_init() {
     state_load_session "${SESSION_IDS[1]}"
   else
     state_new_session "$SESSION_MODEL" "$SESSION_SYSTEM_PROMPT"
+  fi
+  if (( ZCHAT_MODEL_OVERRIDE )) && [[ -n "$ZCHAT_REQUESTED_MODEL" ]]; then
+    SESSION_MODEL="$ZCHAT_REQUESTED_MODEL"
   fi
 }
 
@@ -119,6 +124,7 @@ state_new_session() {
   MSG_THINKINGS=()
   MSG_THINKING_EXPANDED=()
   MSG_TIMES=()
+  chat_compaction_reset
 
   state_save_session
   state_refresh_sessions_list
@@ -131,9 +137,10 @@ state_save_session() {
 
   local session_dir="${ZCHAT_SESSIONS_DIR}/${CURRENT_SESSION_ID}.session"
   local messages_dir="${session_dir}/messages"
+  local users_dir="${session_dir}/context_users"
   local seq prefix
   local -i i count=${#MSG_ROLES}
-  zf_mkdir -p "$messages_dir" 2>/dev/null || return 1
+  zf_mkdir -p "$messages_dir" "$users_dir" 2>/dev/null || return 1
 
   mapfile[$session_dir/id]="$CURRENT_SESSION_ID"
   mapfile[$session_dir/title]="$SESSION_TITLE"
@@ -142,6 +149,10 @@ state_save_session() {
   mapfile[$session_dir/temperature]="$SESSION_TEMPERATURE"
   mapfile[$session_dir/updated_at]="$EPOCHSECONDS"
   mapfile[$session_dir/message_count]="$count"
+  mapfile[$session_dir/compaction_summary]="$CHAT_COMPACTION_SUMMARY"
+  mapfile[$session_dir/compaction_count]="$CHAT_COMPACTION_COUNT"
+  mapfile[$session_dir/context_start_index]="$CHAT_CONTEXT_START_INDEX"
+  mapfile[$session_dir/context_user_count]="${#CHAT_USER_MESSAGES}"
 
   for (( i=1; i<=count; i++ )); do
     printf -v seq '%06d' "$i"
@@ -151,6 +162,11 @@ state_save_session() {
     mapfile[$prefix.thinking]="${MSG_THINKINGS[i]:-}"
     mapfile[$prefix.expanded]="${MSG_THINKING_EXPANDED[i]:-0}"
     mapfile[$prefix.time]="${MSG_TIMES[i]:-}"
+  done
+
+  for (( i=1; i<=${#CHAT_USER_MESSAGES}; i++ )); do
+    printf -v seq '%06d' "$i"
+    mapfile[$users_dir/$seq]="${CHAT_USER_MESSAGES[i]}"
   done
 }
 
@@ -165,6 +181,7 @@ state_load_session() {
   SESSION_MODEL="${mapfile[$session_dir/model]:-gemma4:12b}"
   SESSION_SYSTEM_PROMPT="${mapfile[$session_dir/system_prompt]}"
   SESSION_TEMPERATURE="${mapfile[$session_dir/temperature]:-0.7}"
+  chat_compaction_reset
 
   MSG_ROLES=()
   MSG_CONTENTS=()
@@ -183,6 +200,25 @@ state_load_session() {
     MSG_THINKING_EXPANDED+=("${mapfile[$prefix.expanded]:-0}")
     MSG_TIMES+=("${mapfile[$prefix.time]}")
   done
+  CHAT_COMPACTION_SUMMARY="${mapfile[$session_dir/compaction_summary]}"
+  CHAT_COMPACTION_COUNT="${mapfile[$session_dir/compaction_count]:-0}"
+  CHAT_CONTEXT_START_INDEX="${mapfile[$session_dir/context_start_index]:-1}"
+  [[ "$CHAT_COMPACTION_COUNT" == <0-> ]] || CHAT_COMPACTION_COUNT=0
+  [[ "$CHAT_CONTEXT_START_INDEX" == <1-> ]] || CHAT_CONTEXT_START_INDEX=1
+  (( CHAT_CONTEXT_START_INDEX <= len + 1 )) || CHAT_CONTEXT_START_INDEX=1
+
+  local -i user_count="${mapfile[$session_dir/context_user_count]:-0}"
+  [[ "$user_count" == <0-> ]] || user_count=0
+  if (( user_count > 0 )); then
+    for (( i=1; i<=user_count; i++ )); do
+      printf -v seq '%06d' "$i"
+      CHAT_USER_MESSAGES+=("${mapfile[$session_dir/context_users/$seq]}")
+    done
+  else
+    for (( i=1; i<=len; i++ )); do
+      [[ "${MSG_ROLES[i]}" == user ]] && CHAT_USER_MESSAGES+=("${MSG_CONTENTS[i]}")
+    done
+  fi
 }
 
 # Delete a session
@@ -218,6 +254,7 @@ state_append_message() {
   MSG_THINKINGS+=("$thinking")
   MSG_THINKING_EXPANDED+=("$thinking_expanded")
   MSG_TIMES+=("$time_str")
+  [[ "$role" == user ]] && CHAT_USER_MESSAGES+=("$content")
 
   # Auto-generate title from first user message if still "New Chat"
   if [[ "$role" == "user" && "$SESSION_TITLE" == "New Chat" ]]; then
@@ -288,29 +325,38 @@ state_toggle_last_reasoning() {
   return 1
 }
 
-# Build payload for Ollama chat API (only real conversation content, no system artifacts)
+# Build the bounded model payload. The complete MSG_* transcript remains intact
+# for rendering and persistence after older model context has been compacted.
 state_build_payload() {
   local -i count=${#MSG_ROLES} i
-  local payload="" model_json="" role_json="" content_json=""
+  local payload="" model_json="" role_json="" content_json="" system_prompt="$SESSION_SYSTEM_PROMPT"
   local temperature="$SESSION_TEMPERATURE"
-  local comma=""
+  local comma="" options=""
 
   [[ "$temperature" =~ '^-?[0-9]+([.][0-9]+)?$' ]] || temperature="0.7"
+  if [[ -n "$CHAT_COMPACTION_SUMMARY" ]]; then
+    [[ -n "$system_prompt" ]] && system_prompt+=$'\n\n'
+    system_prompt+=$'<compacted_context>\n'"$CHAT_COMPACTION_SUMMARY"$'\n</compacted_context>'
+  fi
   json_quote "$SESSION_MODEL"; model_json="$REPLY"
   payload="{\"model\":${model_json},\"messages\":["
 
-  if [[ -n "$SESSION_SYSTEM_PROMPT" ]]; then
-    json_quote "$SESSION_SYSTEM_PROMPT"; content_json="$REPLY"
+  if [[ -n "$system_prompt" ]]; then
+    json_quote "$system_prompt"; content_json="$REPLY"
     payload+="{\"role\":\"system\",\"content\":${content_json}}"
     comma=","
   fi
 
-  for (( i=1; i<=count; i++ )); do
+  for (( i=CHAT_CONTEXT_START_INDEX; i<=count; i++ )); do
+    [[ "${MSG_ROLES[i]}" == user || "${MSG_ROLES[i]}" == assistant ]] || continue
+    [[ -n "${MSG_CONTENTS[i]}" ]] || continue
     json_quote "${MSG_ROLES[i]}"; role_json="$REPLY"
     json_quote "${MSG_CONTENTS[i]}"; content_json="$REPLY"
     payload+="${comma}{\"role\":${role_json},\"content\":${content_json}}"
     comma=","
   done
 
-  REPLY="${payload}],\"options\":{\"temperature\":${temperature}},\"stream\":true}"
+  chat_context_options_json
+  options="$REPLY"
+  REPLY="${payload}],\"options\":{${options}\"temperature\":${temperature}},\"stream\":true}"
 }

@@ -7,6 +7,7 @@ typeset -g TOP_H=3
 typeset -g SIDE_W=24
 typeset -g INPUT_H=4
 typeset -g FOOT_H=1
+typeset -gr INPUT_MAX_ROWS=4
 typeset -gF UI_NEXT_RESIZE_CHECK=0.0
 typeset -grF UI_RESIZE_CHECK_INTERVAL=0.25
 
@@ -18,6 +19,22 @@ typeset -g CHAT_SCROLL_OFFSET=0
 typeset -g CHAT_AUTO_SCROLL=1
 typeset -g UI_STATUS_TEXT="Ready"
 
+# Width available to one visual editor row after the prompt marker.
+ui_input_width() {
+  REPLY=$(( SCREEN_W - 6 ))
+  (( REPLY < 1 )) && REPLY=1
+}
+
+ui_calculate_input_height() {
+  local -i max_rows=$INPUT_MAX_ROWS
+  local -i available=$(( SCREEN_H - TOP_H - FOOT_H - 5 ))
+  (( available < 1 )) && available=1
+  (( max_rows > available )) && max_rows=$available
+  ui_input_width
+  input_layout "$REPLY" "$max_rows"
+  INPUT_H=$(( INPUT_VISIBLE_ROWS + 2 ))
+}
+
 # Query terminal geometry and allocate curses windows
 ui_setup_windows() {
   ui_destroy_windows
@@ -28,16 +45,6 @@ ui_setup_windows() {
   SCREEN_H=${scr_pos[5]:-${LINES:-24}}
   SCREEN_W=${scr_pos[6]:-${COLUMNS:-80}}
 
-  local top_h=3
-  local foot_h=1
-  local input_h=4
-
-  # Adapt to smaller terminal heights
-  if (( SCREEN_H < 22 )); then
-    top_h=3
-    input_h=3
-  fi
-
   # Dynamic sidebar width
   if (( SCREEN_W < 75 )); then
     SIDE_W=0
@@ -47,28 +54,28 @@ ui_setup_windows() {
     SIDE_W=24
   fi
 
-  local main_h=$(( SCREEN_H - top_h - foot_h - input_h ))
+  TOP_H=3
+  FOOT_H=1
+  ui_calculate_input_height
+
+  local main_h=$(( SCREEN_H - TOP_H - FOOT_H - INPUT_H ))
   if (( main_h < 3 )); then
     main_h=3
   fi
 
-  TOP_H=$top_h
-  INPUT_H=$input_h
-  FOOT_H=$foot_h
-
   local chat_x=$SIDE_W
   local chat_w=$(( SCREEN_W - SIDE_W ))
-  local input_y=$(( top_h + main_h ))
-  local foot_y=$(( SCREEN_H - foot_h ))
+  local input_y=$(( TOP_H + main_h ))
+  local foot_y=$(( SCREEN_H - FOOT_H ))
 
   # Create windows strictly within stdscr boundaries
-  zcurses addwin top_win $top_h $SCREEN_W 0 0 2>/dev/null
+  zcurses addwin top_win $TOP_H $SCREEN_W 0 0 2>/dev/null
   if (( SIDE_W > 0 )); then
-    zcurses addwin side_win $main_h $SIDE_W $top_h 0 2>/dev/null
+    zcurses addwin side_win $main_h $SIDE_W $TOP_H 0 2>/dev/null
   fi
-  zcurses addwin chat_win $main_h $chat_w $top_h $chat_x 2>/dev/null
-  zcurses addwin input_win $input_h $SCREEN_W $input_y 0 2>/dev/null
-  zcurses addwin foot_win $foot_h $SCREEN_W $foot_y 0 2>/dev/null
+  zcurses addwin chat_win $main_h $chat_w $TOP_H $chat_x 2>/dev/null
+  zcurses addwin input_win $INPUT_H $SCREEN_W $input_y 0 2>/dev/null
+  zcurses addwin foot_win $FOOT_H $SCREEN_W $foot_y 0 2>/dev/null
 }
 
 # Check the physical terminal dimensions without an external stty dependency.
@@ -102,6 +109,30 @@ ui_resize_windows() {
 
   ui_setup_windows
   ui_refresh_all 0
+}
+
+# Keep checkpoint generation cancellable even though its Ollama response is
+# deliberately non-streaming. Other editing input waits for the request.
+ui_wait_for_compaction() {
+  local ch="" key="" mouse=""
+  while ! api_async_ready; do
+    ui_poll_resize
+    ch=""; key=""; mouse=""
+    zcurses timeout input_win 50
+    zcurses input input_win ch key mouse
+    if [[ "$ch" == $'\x1b' || "$ch" == $'\x03' ]]; then
+      return 130
+    elif [[ "$key" == "PPAGE" ]]; then
+      CHAT_AUTO_SCROLL=0
+      (( CHAT_SCROLL_OFFSET -= 6 ))
+      (( CHAT_SCROLL_OFFSET < 0 )) && CHAT_SCROLL_OFFSET=0
+      ui_draw_chat 0
+    elif [[ "$key" == "NPAGE" ]]; then
+      (( CHAT_SCROLL_OFFSET += 6 ))
+      ui_draw_chat 0
+    fi
+  done
+  return 0
 }
 
 # Destroy all windows
@@ -309,14 +340,15 @@ ui_draw_chat() {
   zcurses refresh chat_win
 }
 
-# Render the Input Box
+# Render the multiline, cursor-following prompt editor.
 ui_draw_input() {
-  local inner_w=$(( SCREEN_W - 4 ))
-  local disp_buf="$INPUT_BUF"
-  local disp_pos=$INPUT_POS
-  local max_input_w=$(( inner_w - 2 ))
-  local start_char=1
-  local visible_input="" cursor_x=4
+  local -i defer_refresh="${1:-0}"
+  local -i max_rows=$(( INPUT_H - 2 )) row visual_row cursor_y cursor_x total
+  local visible="" marker="" title=" Prompt (Enter sends · Shift-Enter newline) "
+
+  ui_input_width
+  input_layout "$REPLY" "$max_rows"
+  total=${#INPUT_VISUAL_LINES}
 
   zcurses clear input_win
   if [[ "$FOCUS_PANE" == "input" ]]; then
@@ -328,45 +360,53 @@ ui_draw_input() {
 
   zcurses move input_win 0 2
   zcurses attr input_win bold white/black
-  zcurses string input_win " Prompt (Enter to Send, Ctrl+C to cancel) "
-
-  zcurses move input_win 1 2
-  zcurses attr input_win bold green/black
-  zcurses string input_win "❯ "
-
-  zcurses attr input_win bold white/black
-
-  # Horizontal scrolling for long inputs
-  if (( disp_pos > max_input_w )); then
-    start_char=$(( disp_pos - max_input_w + 1 ))
+  if (( total > INPUT_VISIBLE_ROWS )); then
+    title=" Prompt (Enter sends · Shift-Enter newline · ${INPUT_VIEW_TOP}-$(( INPUT_VIEW_TOP + INPUT_VISIBLE_ROWS - 1 ))/${total}) "
   fi
+  zcurses string input_win "${title[1,$(( SCREEN_W - 4 ))]}"
 
-  visible_input="${disp_buf[start_char,$(( start_char + max_input_w ))]}"
-  zcurses string input_win "$visible_input"
+  for (( row=1; row<=INPUT_VISIBLE_ROWS; row++ )); do
+    visual_row=$(( INPUT_VIEW_TOP + row - 1 ))
+    visible="${INPUT_VISUAL_LINES[visual_row]}"
+    marker="│"
+    (( visual_row == 1 )) && marker="❯"
+    (( row == 1 && INPUT_VIEW_TOP > 1 )) && marker="↑"
+    (( row == INPUT_VISIBLE_ROWS && visual_row < total )) && marker="↓"
+    zcurses move input_win $row 2
+    zcurses attr input_win bold green/black
+    zcurses string input_win "$marker "
+    zcurses attr input_win white/black
+    zcurses string input_win "$visible"
+  done
 
-  # Position the active cursor inside the input window
-  cursor_x=$(( 4 + disp_pos - start_char + 1 ))
+  cursor_y=$(( INPUT_CURSOR_ROW - INPUT_VIEW_TOP + 1 ))
+  cursor_x=$(( 4 + INPUT_CURSOR_COL ))
+  (( cursor_y < 1 )) && cursor_y=1
+  (( cursor_y > INPUT_VISIBLE_ROWS )) && cursor_y=$INPUT_VISIBLE_ROWS
   (( cursor_x < 4 )) && cursor_x=4
   (( cursor_x > SCREEN_W - 2 )) && cursor_x=$(( SCREEN_W - 2 ))
-  zcurses move input_win 1 $cursor_x
+  zcurses move input_win $cursor_y $cursor_x
 
-  zcurses refresh input_win
+  (( defer_refresh )) || zcurses refresh input_win
+}
+
+# Grow the prompt upward only when it crosses a visual-row boundary.
+ui_input_changed() {
+  local -i previous_height=$INPUT_H
+  ui_calculate_input_height
+  if (( INPUT_H != previous_height )); then
+    ui_setup_windows
+    ui_refresh_all 0
+  else
+    ui_draw_input
+  fi
 }
 
 # Render the Bottom Footer Bar
 ui_draw_footer() {
-  local bar_str="" padded=""
+  local bar_str=" Enter Send  S/M-Enter Newline  ^O Model  ^R Reason  ^N New  PgUp/Dn Scroll  ^Q Quit" padded=""
   zcurses clear foot_win
   zcurses attr foot_win reverse dim white/black
-  printf -v bar_str " %-7s %-12s %-12s %-8s %-10s %-10s %-8s" \
-    "[Enter]" "Send" \
-    "[^O] Model" \
-    "[^R] Reason" \
-    "[^N] New" \
-    "[^S] System" \
-    "[Tab] Focus" \
-    "[^Q] Quit"
-
   zchat_pad_right "$bar_str" "$SCREEN_W"
   padded="$REPLY"
   zcurses move foot_win 0 0

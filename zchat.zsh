@@ -11,9 +11,11 @@ zmodload zsh/curses zsh/datetime zsh/files zsh/mapfile zsh/net/tcp \
 }
 
 typeset -gr ZCHAT_NAME="zchat.zsh"
-typeset -gr ZCHAT_VERSION="1.0.1"
+typeset -gr ZCHAT_VERSION="1.0.3"
 typeset -gr ZCHAT_DEFAULT_OLLAMA_HOST="localhost:11434"
 typeset -g ZCHAT_HOST_OVERRIDE=0
+typeset -g ZCHAT_MODEL_OVERRIDE=0
+typeset -g ZCHAT_REQUESTED_MODEL=""
 [[ -n "${OLLAMA_HOST:-}" ]] && ZCHAT_HOST_OVERRIDE=1
 
 # Locate script directory
@@ -26,6 +28,7 @@ source "${ZCHAT_DIR}/lib/util.zsh"
 source "${ZCHAT_DIR}/lib/json.zsh"
 source "${ZCHAT_DIR}/lib/api.zsh"
 source "${ZCHAT_DIR}/lib/state.zsh"
+source "${ZCHAT_DIR}/lib/compact.zsh"
 source "${ZCHAT_DIR}/lib/render.zsh"
 source "${ZCHAT_DIR}/lib/input.zsh"
 source "${ZCHAT_DIR}/lib/modal.zsh"
@@ -46,12 +49,32 @@ while (( $# > 0 )); do
     --model|-m)
       shift
       SESSION_MODEL="$1"
+      ZCHAT_REQUESTED_MODEL="$1"
+      ZCHAT_MODEL_OVERRIDE=1
+      ;;
+    --context-window)
+      shift
+      if [[ "$1" != auto && "$1" != <4096-> ]]; then
+        echo "Error: --context-window expects auto or an integer of at least 4096" >&2
+        exit 2
+      fi
+      ZCHAT_CONTEXT_WINDOW="$1"
+      ;;
+    --compact-at)
+      shift
+      if [[ "$1" != <25-90> ]]; then
+        echo "Error: --compact-at expects an integer from 25 through 90" >&2
+        exit 2
+      fi
+      ZCHAT_COMPACT_PERCENT="$1"
       ;;
     --help)
       echo "Usage: ${ZCHAT_NAME} [options]"
       echo "Options:"
       echo "  --host, -h <URL>         Ollama server (default: ${ZCHAT_DEFAULT_OLLAMA_HOST})"
       echo "  --model, -m <model>      Default model name"
+      echo "  --context-window <N>     Context tokens to request, or auto"
+      echo "  --compact-at <percent>   Compact at 25-90% (default: 85)"
       echo "  --version, -V            Show version"
       echo "  --help                   Show this help"
       exit 0
@@ -72,6 +95,7 @@ typeset -g STREAM_PID=""
 typeset -g STREAM_BASE_FILE="/tmp/zchat_stream_$$"
 typeset -g STREAM_LAST_CONTENT=""
 typeset -g STREAM_LAST_THINKING=""
+typeset -g STREAM_PAYLOAD=""
 typeset -ga SPINNER_CHARS=('⠋' '⠙' '⠹' '⠸' '⠼' '⠴' '⠦' '⠧' '⠇' '⠏')
 typeset -g SPINNER_IDX=1
 
@@ -79,9 +103,11 @@ typeset -g SPINNER_IDX=1
 cleanup() {
   RUNNING=0
   api_stop_stream "$STREAM_PID"
+  [[ -n "$API_ASYNC_PID" ]] && api_async_cancel
   zf_rm -f "${STREAM_BASE_FILE}"* 2>/dev/null
   ui_destroy_windows
   zcurses end 2>/dev/null
+  print -rn -- $'\e[?2004l' > /dev/tty 2>/dev/null
   print -rn -- "${terminfo[cnorm]}" 2>/dev/null
 }
 trap cleanup EXIT INT TERM HUP
@@ -92,6 +118,8 @@ main() {
   input_init
 
   zcurses init
+  # Delimit pasted text so embedded newlines remain inside one prompt.
+  print -rn -- $'\e[?2004h' > /dev/tty 2>/dev/null
   ui_setup_windows
   ui_refresh_all 0
 
@@ -103,6 +131,8 @@ main() {
   local t_file="${STREAM_BASE_FILE}.thinking"
   local c_file="${STREAM_BASE_FILE}.content"
   local done_file="${STREAM_BASE_FILE}.done"
+  local usage_file="${STREAM_BASE_FILE}.usage"
+  local usage_line="" prompt_tokens="0" output_tokens="0"
   local prompt_text="" payload=""
   local curr_idx=1 i=1
 
@@ -123,7 +153,19 @@ main() {
         raw_content="$REPLY"
         state_set_last_assistant_message "$raw_content" "$raw_thinking"
 
+        zchat_read_file "$usage_file"
+        usage_line="$REPLY"
+        if [[ "$usage_line" == <0->' '*<0->* ]]; then
+          prompt_tokens="${usage_line%% *}"
+          output_tokens="${${usage_line#* }%%$'\n'*}"
+        else
+          prompt_tokens=0
+          output_tokens=0
+        fi
+        chat_record_response_usage "$STREAM_PAYLOAD" "$prompt_tokens" "$output_tokens"
+
         STREAM_PID=""
+        STREAM_PAYLOAD=""
         STREAM_LAST_THINKING=""
         STREAM_LAST_CONTENT=""
         zf_rm -f "${STREAM_BASE_FILE}"* 2>/dev/null
@@ -180,6 +222,24 @@ main() {
     key=""
     mouse=""
 
+    if [[ "$cur_key" == "RESIZE" ]]; then
+      ui_poll_resize
+      continue
+    fi
+
+    # Decode multiline input protocols before ordinary key dispatch. A paste
+    # is inserted as one editor action and therefore can never submit itself.
+    if [[ "$FOCUS_PANE" == "input" ]] && input_decode_terminal_event "$cur_ch" "$cur_key"; then
+      if [[ "$INPUT_EVENT_ACTION" == "newline" ]]; then
+        input_insert $'\n'
+        ui_input_changed
+      elif [[ "$INPUT_EVENT_ACTION" == "paste" && -n "$INPUT_EVENT_TEXT" ]]; then
+        input_insert "$INPUT_EVENT_TEXT"
+        ui_input_changed
+      fi
+      continue
+    fi
+
     # --------------------------------------------------------------------------
     # 3. Global Keybindings
     # --------------------------------------------------------------------------
@@ -192,13 +252,14 @@ main() {
       if [[ -n "$STREAM_PID" ]]; then
         api_stop_stream "$STREAM_PID"
         STREAM_PID=""
+        STREAM_PAYLOAD=""
         zf_rm -f "${STREAM_BASE_FILE}"* 2>/dev/null
         UI_STATUS_TEXT="Stopped"
         state_append_message "system" "⏹ Response generation cancelled."
         ui_refresh_all 0
       else
         input_clear
-        ui_draw_input
+        ui_input_changed
       fi
 
     # Ctrl+R (^R = \x12): Toggle Reasoning block expansion
@@ -211,7 +272,8 @@ main() {
       state_new_session "$SESSION_MODEL" "$SESSION_SYSTEM_PROMPT"
       CHAT_SCROLL_OFFSET=0
       CHAT_AUTO_SCROLL=1
-      input_init
+      input_reset
+      ui_setup_windows
       ui_refresh_all 0
 
     # Ctrl+O (^O = \x0f): Switch model dialog
@@ -306,14 +368,25 @@ main() {
       # Enter: Dispatch prompt
       if [[ "$cur_ch" == $'\n' || "$cur_ch" == $'\r' || "$cur_key" == "ENTER" || "$cur_key" == "PADENTER" ]]; then
         input_submit
-        prompt_text="$INPUT_LAST_SUBMITTED"
+        prompt_text="$INPUT_SUBMITTED"
+        ui_input_changed
 
         if [[ -n "$prompt_text" ]]; then
           # Check for slash commands
           case "$prompt_text" in
-            /model*)
+            /model)
               modal_select_model
               ui_setup_windows
+              ui_refresh_all 0
+              ;;
+            /model\ *)
+              local requested_model="${prompt_text#/model }"
+              requested_model="${requested_model##[[:space:]]#}"
+              if [[ -n "$requested_model" ]]; then
+                SESSION_MODEL="$requested_model"
+                state_save_session
+                state_append_message "system" "Model changed to ${SESSION_MODEL}."
+              fi
               ui_refresh_all 0
               ;;
             /host|/host\ *)
@@ -347,6 +420,32 @@ main() {
               CHAT_AUTO_SCROLL=1
               ui_refresh_all 0
               ;;
+            /compact)
+              if [[ -n "$STREAM_PID" ]]; then
+                state_append_message "system" "Wait for the current response to finish before compacting."
+              else
+                UI_STATUS_TEXT="Compacting"
+                ui_refresh_all 0
+                if chat_compact_history manual; then
+                  UI_STATUS_TEXT="Ready"
+                elif (( CHAT_COMPACTION_CANCELLED )); then
+                  state_append_message "system" "⏹ Compaction stopped."
+                  UI_STATUS_TEXT="Stopped"
+                elif [[ -z "$CHAT_COMPACTION_ERROR" ]]; then
+                  state_append_message "system" "Nothing to compact yet."
+                  UI_STATUS_TEXT="Ready"
+                else
+                  state_append_message "system" "Compaction failed: ${CHAT_COMPACTION_ERROR}"
+                  UI_STATUS_TEXT="Error"
+                fi
+              fi
+              ui_refresh_all 0
+              ;;
+            /context)
+              chat_context_summary
+              state_append_message "system" "$REPLY"
+              ui_refresh_all 0
+              ;;
             /help|/\?)
               modal_show_help
               ui_setup_windows
@@ -359,8 +458,16 @@ main() {
               # 1. Append user prompt
               state_append_message "user" "$prompt_text"
 
-              # 2. Build payload BEFORE adding placeholder assistant message
-              state_build_payload
+              # 2. Compact when needed and build the bounded model payload.
+              UI_STATUS_TEXT="Preparing"
+              ui_refresh_all 0
+              if ! chat_prepare_payload; then
+                state_append_message "system" "Could not prepare the conversation: ${CHAT_COMPACTION_ERROR:-unknown compaction error}"
+                UI_STATUS_TEXT="Error"
+                ui_refresh_all 0
+                ui_draw_input
+                continue
+              fi
               payload="$REPLY"
 
               # 3. Create initial assistant message for UI (expanded thinking mode)
@@ -373,6 +480,7 @@ main() {
               # 4. Start background streaming
               api_start_stream "$OLLAMA_HOST" "$payload" "$STREAM_BASE_FILE"
               STREAM_PID="$API_STREAM_PID"
+              STREAM_PAYLOAD="$payload"
               ;;
           esac
         fi
@@ -381,40 +489,42 @@ main() {
       # Line editing keys
       elif [[ "$cur_key" == "BACKSPACE" || "$cur_ch" == $'\x7f' || "$cur_ch" == $'\b' ]]; then
         input_backspace
-        ui_draw_input
+        ui_input_changed
       elif [[ "$cur_key" == "DC" || "$cur_key" == "DELETE" ]]; then
         input_delete
-        ui_draw_input
+        ui_input_changed
       elif [[ "$cur_key" == "LEFT" ]]; then
         input_left
-        ui_draw_input
+        ui_input_changed
       elif [[ "$cur_key" == "RIGHT" ]]; then
         input_right
-        ui_draw_input
+        ui_input_changed
       elif [[ "$cur_key" == "HOME" || "$cur_ch" == $'\x01' ]]; then
         input_home
-        ui_draw_input
+        ui_input_changed
       elif [[ "$cur_key" == "END" || "$cur_ch" == $'\x05' ]]; then
         input_end
-        ui_draw_input
+        ui_input_changed
       elif [[ "$cur_ch" == $'\x15' ]]; then
         # Ctrl+U: Clear line
         input_clear
-        ui_draw_input
+        ui_input_changed
       elif [[ "$cur_ch" == $'\x17' ]]; then
         # Ctrl+W: Kill word
         input_kill_word
-        ui_draw_input
+        ui_input_changed
       elif [[ "$cur_key" == "UP" ]]; then
-        input_hist_prev
-        ui_draw_input
+        ui_input_width
+        input_move_vertical -1 "$REPLY" $(( INPUT_H - 2 )) || input_history_previous
+        ui_input_changed
       elif [[ "$cur_key" == "DOWN" ]]; then
-        input_hist_next
-        ui_draw_input
+        ui_input_width
+        input_move_vertical 1 "$REPLY" $(( INPUT_H - 2 )) || input_history_next
+        ui_input_changed
       elif [[ -n "$cur_ch" && "$cur_ch" != $'\x1b' ]]; then
         # Printable character input
-        input_insert_char "$cur_ch"
-        ui_draw_input
+        input_insert "$cur_ch"
+        ui_input_changed
       fi
     fi
   done

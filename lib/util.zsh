@@ -68,3 +68,13 @@ zchat_read_file() {
 zchat_time() {
   strftime -s REPLY '%H:%M'
 }
+
+# Bound model-generated checkpoints without an external text utility.
+zchat_truncate() {
+  local value="$1" limit="${2:-8192}"
+  if (( ${#value} > limit )); then
+    REPLY="${value[1,$limit]}"$'\n'"[checkpoint truncated at ${limit} characters]"
+  else
+    REPLY="$value"
+  fi
+}

@@ -11,9 +11,12 @@ typeset -g JSON_MESSAGE_THINKING=""
 typeset -g JSON_MESSAGE_CONTENT=""
 typeset -g JSON_MESSAGE_ERROR=""
 typeset -gi JSON_MESSAGE_DONE=0
+typeset -gi JSON_MESSAGE_PROMPT_TOKENS=0
+typeset -gi JSON_MESSAGE_OUTPUT_TOKENS=0
 
 typeset -gA JSON_CONFIG=()
 typeset -ga JSON_MODEL_NAMES=()
+typeset -gi JSON_RUNNING_MODEL_CONTEXT=0
 
 typeset -g JSON_SESSION_ID=""
 typeset -g JSON_SESSION_TITLE=""
@@ -272,6 +275,8 @@ json_parse_ollama_event() {
   JSON_MESSAGE_CONTENT=""
   JSON_MESSAGE_ERROR=""
   JSON_MESSAGE_DONE=0
+  JSON_MESSAGE_PROMPT_TOKENS=0
+  JSON_MESSAGE_OUTPUT_TOKENS=0
 
   json_begin "$1" || return 1
   [[ "$JSON_TOKEN_TYPE" == '{' ]] || return 1
@@ -289,6 +294,14 @@ json_parse_ollama_event() {
       done:true) JSON_MESSAGE_DONE=1; json_next || return 1 ;;
       done:false) JSON_MESSAGE_DONE=0; json_next || return 1 ;;
       error:string) JSON_MESSAGE_ERROR="$JSON_TOKEN_VALUE"; json_next || return 1 ;;
+      prompt_eval_count:number)
+        [[ "$JSON_TOKEN_VALUE" == <0-> ]] && JSON_MESSAGE_PROMPT_TOKENS="$JSON_TOKEN_VALUE"
+        json_next || return 1
+        ;;
+      eval_count:number)
+        [[ "$JSON_TOKEN_VALUE" == <0-> ]] && JSON_MESSAGE_OUTPUT_TOKENS="$JSON_TOKEN_VALUE"
+        json_next || return 1
+        ;;
       *) json_skip_value || return 1 ;;
     esac
 
@@ -394,6 +407,81 @@ json_parse_models() {
       return 1
     fi
   done
+}
+
+_json_model_names_match() {
+  local left="$1" right="$2"
+  [[ "$left" == *:* ]] || left+=":latest"
+  [[ "$right" == *:* ]] || right+=":latest"
+  [[ "$left" == "$right" ]]
+}
+
+_json_parse_running_model() {
+  local target="$1" key="" name="" model=""
+  local -i context_length=0
+  [[ "$JSON_TOKEN_TYPE" == '{' ]] || return 1
+  json_next || return 1
+  while [[ "$JSON_TOKEN_TYPE" != '}' ]]; do
+    [[ "$JSON_TOKEN_TYPE" == string ]] || return 1
+    key="$JSON_TOKEN_VALUE"
+    json_next || return 1
+    [[ "$JSON_TOKEN_TYPE" == ':' ]] || return 1
+    json_next || return 1
+    case "$key:$JSON_TOKEN_TYPE" in
+      name:string) name="$JSON_TOKEN_VALUE"; json_next || return 1 ;;
+      model:string) model="$JSON_TOKEN_VALUE"; json_next || return 1 ;;
+      context_length:number)
+        [[ "$JSON_TOKEN_VALUE" == <1-> ]] && context_length="$JSON_TOKEN_VALUE"
+        json_next || return 1
+        ;;
+      *) json_skip_value || return 1 ;;
+    esac
+    if [[ "$JSON_TOKEN_TYPE" == ',' ]]; then
+      json_next || return 1
+    elif [[ "$JSON_TOKEN_TYPE" != '}' ]]; then
+      return 1
+    fi
+  done
+  json_next || return 1
+  if _json_model_names_match "$name" "$target" || _json_model_names_match "$model" "$target"; then
+    JSON_RUNNING_MODEL_CONTEXT="$context_length"
+  fi
+}
+
+# Read the context Ollama actually allocated to a loaded model from /api/ps.
+json_parse_running_model_context() {
+  local source="$1" target="$2" key=""
+  JSON_RUNNING_MODEL_CONTEXT=0
+  json_begin "$source" || return 1
+  [[ "$JSON_TOKEN_TYPE" == '{' ]] || return 1
+  json_next || return 1
+  while [[ "$JSON_TOKEN_TYPE" != '}' ]]; do
+    [[ "$JSON_TOKEN_TYPE" == string ]] || return 1
+    key="$JSON_TOKEN_VALUE"
+    json_next || return 1
+    [[ "$JSON_TOKEN_TYPE" == ':' ]] || return 1
+    json_next || return 1
+    if [[ "$key" == models && "$JSON_TOKEN_TYPE" == '[' ]]; then
+      json_next || return 1
+      while [[ "$JSON_TOKEN_TYPE" != ']' ]]; do
+        _json_parse_running_model "$target" || return 1
+        if [[ "$JSON_TOKEN_TYPE" == ',' ]]; then
+          json_next || return 1
+        elif [[ "$JSON_TOKEN_TYPE" != ']' ]]; then
+          return 1
+        fi
+      done
+      json_next || return 1
+    else
+      json_skip_value || return 1
+    fi
+    if [[ "$JSON_TOKEN_TYPE" == ',' ]]; then
+      json_next || return 1
+    elif [[ "$JSON_TOKEN_TYPE" != '}' ]]; then
+      return 1
+    fi
+  done
+  return 0
 }
 
 _json_parse_session_message() {

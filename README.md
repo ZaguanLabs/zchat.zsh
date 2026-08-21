@@ -1,4 +1,4 @@
-# ⚡ zchat.zsh v1.0.1 — Native ZSH & Curses AI Terminal Interface
+# ⚡ zchat.zsh v1.0.3 — Native ZSH & Curses AI Terminal Interface
 
 > A full-screen, split-pane Terminal User Interface (TUI) AI chat client written in **pure ZSH**, connecting directly to **Ollama's Chat API** through Zsh's native TCP module with live token streaming, collapsible reasoning, and rich Markdown rendering.
 
@@ -52,7 +52,7 @@ See [System Requirements & Prerequisites](#-system-requirements--prerequisites) 
 
 ```
 ┌───────────────────────────────────────────────────────────────────────────┐
-│ ⚡ zchat.zsh v1.0.1 │ Model: gemma4:12b (localhost:11434)     [ Ready ]   │
+│ ⚡ zchat.zsh v1.0.3 │ Model: gemma4:12b (localhost:11434)     [ Ready ]   │
 ├───────────────┬───────────────────────────────────────────────────────────┤
 │ Sessions (3)  │  Chat Transcript (4 msgs)                                 │
 │ ▶ Hello World │  🧑 You  11:00                                            │
@@ -130,7 +130,7 @@ brew install zsh
 * **Header Bar**: Displays active model, Ollama endpoint, and animated status badges (`[ Thinking ⠋ ]`, `[ Streaming ⠋ ]`, `[ Ready ]`).
 * **Sidebar Pane**: Lists saved chat sessions with the active conversation highlighted.
 * **Chat Viewport**: Scrollable message transcript with automatic viewport scrolling during generation.
-* **Input Box**: Feature-rich line editor supporting arrow navigation, backspace, delete, Ctrl+W (kill word), Ctrl+U (clear line), and prompt history.
+* **Multiline Prompt Editor**: A one-to-four-row cursor-following viewport with soft wrapping, hard newlines via `Shift+Enter` or `Alt+Enter`, vertical cursor movement, draft-preserving prompt history, and safe bracketed multiline paste.
 * **Footer Bar**: Live keybinding shortcuts and status hints.
 * **Dynamic Sizing**: Automatically adapts to window resizing (`SIGWINCH`) and gracefully scales on smaller terminal dimensions.
 
@@ -138,9 +138,11 @@ brew install zsh
 * All sessions are saved automatically in native directory-backed storage under `~/.config/zchat/sessions/`.
 * Switch between past conversations instantly from the sidebar using `Tab` and `↑`/`↓`.
 * Delete sessions directly with `d` or `x`.
+* Long conversations retain their complete visible transcript while the model receives a persisted compact checkpoint plus a bounded recent raw exchange.
 
 ### 5. Model Switcher & System Prompts
 * **Model Picker (`Ctrl+O`)**: Queries your Ollama server's `/api/tags` endpoint and opens an interactive modal to browse and switch models live.
+* **Context-aware model loading**: In `auto` mode, zchat uses the active allocation reported by Ollama's `/api/ps`, falls back conservatively for unloaded models, then refreshes after the first response. The chosen `num_ctx` is pinned in chat requests.
 * **System Prompt Presets (`Ctrl+S`)**: Quick-switch between personas:
   * *Default* (Helpful & Knowledgeable)
   * *Coding* (Expert Software Engineer)
@@ -155,6 +157,7 @@ brew install zsh
 | Keybinding | Action | Description |
 | :--- | :--- | :--- |
 | **`Enter`** | **Send Message** | Submits the current input prompt to Ollama |
+| **`Shift + Enter`** / **`Alt + Enter`** | **Newline** | Inserts a newline without sending; Alt+Enter is the terminal-compatible fallback |
 | **`Ctrl + R`** (`^R`) | **Toggle Reasoning** | Expands or collapses the reasoning block of the current response |
 | **`Ctrl + O`** (`^O`) | **Model Selector** | Opens interactive modal to select installed Ollama models |
 | **`Ctrl + N`** (`^N`) | **New Chat** | Starts a fresh chat session with the current model |
@@ -163,7 +166,7 @@ brew install zsh
 | **`Tab`** | **Cycle Focus** | Switches focus between Input $\rightarrow$ Sidebar $\rightarrow$ Chat |
 | **`PgUp` / `PgDn`** | **Scroll Chat** | Scrolls chat transcript history up or down |
 | **`Home` / `End`** | **Jump Chat** | Jumps directly to the start or end of the conversation |
-| **`Up` / `Down`** | **History / Nav** | Recalls prompt history (in input pane) or navigates sessions (in sidebar) |
+| **`Up` / `Down`** | **Prompt / History / Nav** | Moves through multiline prompt rows, then recalls history at prompt boundaries; navigates sessions in the sidebar |
 | **`Ctrl + U`** (`^U`) | **Clear Line** | Clears the entire current input line |
 | **`Ctrl + W`** (`^W`) | **Kill Word** | Deletes the word immediately preceding the cursor |
 | **`Ctrl + H`** / **`F1`** | **Help** | Displays the full keyboard shortcut overlay |
@@ -180,10 +183,13 @@ You can type these directly into the prompt box and hit `Enter`:
 | :--- | :--- |
 | `/reason` or `/think` | Toggle reasoning expand/collapse |
 | `/model` | Open the model selector dialog |
+| `/model NAME` | Switch directly to an Ollama model |
 | `/host` | Show the current Ollama URL and change-command help |
 | `/host http://hostname:11434` | Change and persist the Ollama URL |
 | `/sys` or `/system` | Open the system prompt presets dialog |
 | `/new` or `/clear` | Start a new chat session |
+| `/compact` | Manually create a conversation continuation checkpoint |
+| `/context` | Show context allocation, estimate, threshold, and checkpoint count |
 | `/help` or `/?` | Show keyboard shortcut help overlay |
 | `/quit` or `/exit` or `/q` | Exit application |
 
@@ -201,17 +207,32 @@ chat.sh/
     ├── json.zsh        # Native JSON tokenizer, decoder & encoder
     ├── util.zsh        # Native wrapping, padding, time & file helpers
     ├── state.zsh       # Directory-backed session persistence & state
+    ├── compact.zsh     # Context sizing, token estimates & checkpoints
     ├── render.zsh      # Markdown parser, table formatter & reasoning styling
-    ├── input.zsh       # Line editor buffer, cursor navigation & history
+    ├── input.zsh       # Multiline editor, viewport, history & event decoder
     ├── modal.zsh       # Overlay modals for models, system prompts & help
     └── ui.zsh          # Multi-window curses layout, geometry & rendering
 ```
 
 ### Event Loop Flow
-1. **Input Polling**: `zcurses input` polls non-blocking with a 50ms timeout.
+1. **Input Polling**: `zcurses input` polls non-blocking with a 50ms timeout. Native event decoding recognizes Shift/Alt+Enter and bracketed paste.
 2. **Stream Processing**: A background Zsh worker uses `zsh/net/tcp`, `sysread`, and a native HTTP chunk decoder to consume Ollama's NDJSON stream into `.thinking` and `.content` spool files.
 3. **In-Memory Frame Updates**: As new tokens arrive, `lib/state.zsh` updates in-memory arrays and triggers `ui_refresh_all 1` without disk I/O lag.
-4. **Completion**: On stream finish, `state_save_session` persists the completed conversation to JSON disk storage and transitions reasoning to collapsed state.
+4. **Completion**: On stream finish, `state_save_session` persists the completed conversation, captures Ollama's prompt usage for token-estimate calibration, and transitions reasoning to collapsed state.
+
+### Context Compaction
+
+Compaction follows the continuation-checkpoint design used by `zcoder.zsh`, adapted for ordinary chat rather than tools or coding work:
+
+1. Ollama's `prompt_eval_count` calibrates a conservative pre-request estimate. Before the first usage sample, zchat estimates three bytes per token plus fixed chat-template headroom.
+2. Automatic compaction starts at 85% of the allocated context by default. Change it with `--compact-at PERCENT` or `ZCHAT_COMPACT_PERCENT`.
+3. A non-streaming, non-thinking model turn creates a concise chat checkpoint, capped at the smaller of 2,048 tokens or 10% of the active context.
+4. The model context becomes that checkpoint plus a recent raw tail of the conversation. The full TUI transcript remains visible and saved.
+5. Checkpoints, the retained-tail boundary, and the bounded exact-user ledger are persisted with each session, so resumed conversations keep their compacted context.
+
+Context sizing defaults to `auto`. If the selected model is loaded, zchat uses the allocation from Ollama's `/api/ps`; otherwise it starts with a 65,536-token fallback and refreshes after the first response. Use `--context-window TOKENS` or `ZCHAT_CONTEXT_WINDOW` to request a fixed allocation. Larger contexts consume more memory.
+
+Use `/compact` to checkpoint manually and `/context` to inspect the current budget. Repeated summaries can gradually lose precision, so a focused new chat is still preferable when an old thread is no longer useful.
 
 ---
 
