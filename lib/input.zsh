@@ -11,6 +11,8 @@ typeset -gi INPUT_CURSOR_ROW=1 INPUT_CURSOR_COL=0 INPUT_VIEW_TOP=1 INPUT_VISIBLE
 typeset -gi INPUT_GOAL_COL=-1
 typeset -g INPUT_TERM_STATE="normal" INPUT_ESCAPE_BUF="" INPUT_PASTE_BUF=""
 typeset -g INPUT_EVENT_ACTION="" INPUT_EVENT_TEXT=""
+typeset -g INPUT_LAYOUT_CACHE_BUF=""
+typeset -gi INPUT_LAYOUT_CACHE_POS=-1 INPUT_LAYOUT_CACHE_WIDTH=0 INPUT_LAYOUT_CACHE_MAX_ROWS=0
 
 input_reset() {
   INPUT_BUF=""
@@ -88,6 +90,10 @@ input_layout() {
   local -i width=${1:-1} max_rows=${2:-4}
   (( width < 1 )) && width=1
   (( max_rows < 1 )) && max_rows=1
+  if [[ "$INPUT_LAYOUT_CACHE_BUF" == "$INPUT_BUF" ]] \
+    && (( INPUT_LAYOUT_CACHE_POS == INPUT_POS && INPUT_LAYOUT_CACHE_WIDTH == width && INPUT_LAYOUT_CACHE_MAX_ROWS == max_rows )); then
+    return 0
+  fi
 
   INPUT_VISUAL_LINES=("")
   INPUT_VISUAL_STARTS=(0)
@@ -154,6 +160,10 @@ input_layout() {
     INPUT_VIEW_TOP=$(( total - INPUT_VISIBLE_ROWS + 1 ))
   fi
   (( INPUT_VIEW_TOP < 1 )) && INPUT_VIEW_TOP=1
+  INPUT_LAYOUT_CACHE_BUF="$INPUT_BUF"
+  INPUT_LAYOUT_CACHE_POS=$INPUT_POS
+  INPUT_LAYOUT_CACHE_WIDTH=$width
+  INPUT_LAYOUT_CACHE_MAX_ROWS=$max_rows
 }
 
 input_move_vertical() {

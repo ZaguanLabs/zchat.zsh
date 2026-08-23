@@ -17,6 +17,7 @@ typeset -ga MSG_CONTENTS=()
 typeset -ga MSG_THINKINGS=()
 typeset -ga MSG_THINKING_EXPANDED=()
 typeset -ga MSG_TIMES=()
+typeset -ga MSG_MODELS=()
 
 # Available sessions cache
 typeset -ga SESSION_IDS=()
@@ -25,7 +26,14 @@ typeset -ga SESSION_MODELS=()
 
 # Initialize configuration directories and load initial session
 state_init() {
-  zf_mkdir -p "$ZCHAT_SESSIONS_DIR" 2>/dev/null
+  local old_umask="$(umask)"
+  umask 077
+  zf_mkdir -p "$ZCHAT_SESSIONS_DIR" 2>/dev/null || {
+    umask "$old_umask"
+    return 1
+  }
+  zf_chmod 700 "$ZCHAT_CONFIG_DIR" "$ZCHAT_SESSIONS_DIR" 2>/dev/null || true
+  umask "$old_umask"
 
   if [[ -f "$ZCHAT_CONFIG_FILE" ]]; then
     if json_parse_config "${mapfile[$ZCHAT_CONFIG_FILE]}"; then
@@ -44,6 +52,8 @@ state_init() {
     _state_write_config
   fi
 
+  _state_secure_storage
+
   state_migrate_legacy_sessions
   state_refresh_sessions_list
 
@@ -59,11 +69,34 @@ state_init() {
 }
 
 _state_write_config() {
-  local host_json model_json system_json
+  local host_json model_json system_json output tmp old_umask="$(umask)"
   json_quote "$OLLAMA_HOST"; host_json="$REPLY"
   json_quote "$SESSION_MODEL"; model_json="$REPLY"
   json_quote "$SESSION_SYSTEM_PROMPT"; system_json="$REPLY"
-  mapfile[$ZCHAT_CONFIG_FILE]=$'{\n  "host": '"$host_json"$',\n  "default_model": '"$model_json"$',\n  "temperature": '"$SESSION_TEMPERATURE"$',\n  "system_prompt": '"$system_json"$'\n}\n'
+  output=$'{\n  "host": '"$host_json"$',\n  "default_model": '"$model_json"$',\n  "temperature": '"$SESSION_TEMPERATURE"$',\n  "system_prompt": '"$system_json"$'\n}\n'
+  tmp="${ZCHAT_CONFIG_FILE}.tmp.${sysparams[pid]:-$$}.${RANDOM}"
+  umask 077
+  zf_mkdir -p "${ZCHAT_CONFIG_FILE:h}" 2>/dev/null || { umask "$old_umask"; return 1; }
+  mapfile[$tmp]="$output" || { umask "$old_umask"; return 1; }
+  zf_mv -f "$tmp" "$ZCHAT_CONFIG_FILE" 2>/dev/null || {
+    zf_rm -f "$tmp" 2>/dev/null
+    umask "$old_umask"
+    return 1
+  }
+  zf_chmod 600 "$ZCHAT_CONFIG_FILE" 2>/dev/null || true
+  umask "$old_umask"
+}
+
+_state_secure_storage() {
+  local item
+  zf_chmod 700 "$ZCHAT_CONFIG_DIR" "$ZCHAT_SESSIONS_DIR" 2>/dev/null || true
+  [[ -f "$ZCHAT_CONFIG_FILE" ]] && zf_chmod 600 "$ZCHAT_CONFIG_FILE" 2>/dev/null
+  for item in "${ZCHAT_SESSIONS_DIR}"/*.session(N/) "${ZCHAT_SESSIONS_DIR}"/*.session/**/*(N/); do
+    zf_chmod 700 "$item" 2>/dev/null || true
+  done
+  for item in "${ZCHAT_SESSIONS_DIR}"/*.json(N.) "${ZCHAT_SESSIONS_DIR}"/*.session/**/*(N.); do
+    zf_chmod 600 "$item" 2>/dev/null || true
+  done
 }
 
 # Convert legacy JSON sessions once, retaining the originals as backups.
@@ -84,6 +117,7 @@ state_migrate_legacy_sessions() {
     MSG_THINKINGS=("${JSON_SESSION_THINKINGS[@]}")
     MSG_THINKING_EXPANDED=("${JSON_SESSION_EXPANDED[@]}")
     MSG_TIMES=("${JSON_SESSION_TIMES[@]}")
+    MSG_MODELS=()
     state_save_session
   done
 }
@@ -124,7 +158,9 @@ state_new_session() {
   MSG_THINKINGS=()
   MSG_THINKING_EXPANDED=()
   MSG_TIMES=()
+  MSG_MODELS=()
   chat_compaction_reset
+  (( $+functions[render_invalidate] )) && render_invalidate
 
   state_save_session
   state_refresh_sessions_list
@@ -138,9 +174,17 @@ state_save_session() {
   local session_dir="${ZCHAT_SESSIONS_DIR}/${CURRENT_SESSION_ID}.session"
   local messages_dir="${session_dir}/messages"
   local users_dir="${session_dir}/context_users"
-  local seq prefix
-  local -i i count=${#MSG_ROLES}
-  zf_mkdir -p "$messages_dir" "$users_dir" 2>/dev/null || return 1
+  local seq prefix message_model old_umask="$(umask)"
+  local -i i count=${#MSG_ROLES} old_message_count=${mapfile[$session_dir/message_count]:-0}
+  local -i old_user_count=${mapfile[$session_dir/context_user_count]:-0}
+  [[ "$old_message_count" == <0-> ]] || old_message_count=0
+  [[ "$old_user_count" == <0-> ]] || old_user_count=0
+  umask 077
+  zf_mkdir -p "$messages_dir" "$users_dir" 2>/dev/null || {
+    umask "$old_umask"
+    return 1
+  }
+  zf_chmod 700 "$ZCHAT_SESSIONS_DIR" "$session_dir" "$messages_dir" "$users_dir" 2>/dev/null || true
 
   mapfile[$session_dir/id]="$CURRENT_SESSION_ID"
   mapfile[$session_dir/title]="$SESSION_TITLE"
@@ -148,11 +192,17 @@ state_save_session() {
   mapfile[$session_dir/system_prompt]="$SESSION_SYSTEM_PROMPT"
   mapfile[$session_dir/temperature]="$SESSION_TEMPERATURE"
   mapfile[$session_dir/updated_at]="$EPOCHSECONDS"
-  mapfile[$session_dir/message_count]="$count"
   mapfile[$session_dir/compaction_summary]="$CHAT_COMPACTION_SUMMARY"
   mapfile[$session_dir/compaction_count]="$CHAT_COMPACTION_COUNT"
   mapfile[$session_dir/context_start_index]="$CHAT_CONTEXT_START_INDEX"
-  mapfile[$session_dir/context_user_count]="${#CHAT_USER_MESSAGES}"
+  mapfile[$session_dir/compaction_rearm_tokens]="$CHAT_COMPACTION_REARM_TOKENS"
+  mapfile[$session_dir/last_prompt_tokens]="$CHAT_LAST_PROMPT_TOKENS"
+  mapfile[$session_dir/last_output_tokens]="$CHAT_LAST_OUTPUT_TOKENS"
+  mapfile[$session_dir/last_payload_bytes]="$CHAT_LAST_PAYLOAD_BYTES"
+  mapfile[$session_dir/last_usage_model]="$CHAT_LAST_USAGE_MODEL"
+  mapfile[$session_dir/last_usage_host]="$CHAT_LAST_USAGE_HOST"
+  mapfile[$session_dir/compaction_rearm_model]="$CHAT_COMPACTION_REARM_MODEL"
+  mapfile[$session_dir/compaction_rearm_host]="$CHAT_COMPACTION_REARM_HOST"
 
   for (( i=1; i<=count; i++ )); do
     printf -v seq '%06d' "$i"
@@ -162,12 +212,29 @@ state_save_session() {
     mapfile[$prefix.thinking]="${MSG_THINKINGS[i]:-}"
     mapfile[$prefix.expanded]="${MSG_THINKING_EXPANDED[i]:-0}"
     mapfile[$prefix.time]="${MSG_TIMES[i]:-}"
+    message_model="${MSG_MODELS[i]:-}"
+    [[ "${MSG_ROLES[i]}" == assistant && -z "$message_model" ]] && message_model="$SESSION_MODEL"
+    mapfile[$prefix.model]="$message_model"
   done
 
   for (( i=1; i<=${#CHAT_USER_MESSAGES}; i++ )); do
     printf -v seq '%06d' "$i"
     mapfile[$users_dir/$seq]="${CHAT_USER_MESSAGES[i]}"
   done
+  # Counts are commit markers: publish them only after their referenced files.
+  mapfile[$session_dir/message_count]="$count"
+  mapfile[$session_dir/context_user_count]="${#CHAT_USER_MESSAGES}"
+  for (( i=count+1; i<=old_message_count; i++ )); do
+    printf -v seq '%06d' "$i"
+    prefix="$messages_dir/$seq"
+    zf_rm -f -- "$prefix.role" "$prefix.content" "$prefix.thinking" \
+      "$prefix.expanded" "$prefix.time" "$prefix.model" 2>/dev/null
+  done
+  for (( i=${#CHAT_USER_MESSAGES}+1; i<=old_user_count; i++ )); do
+    printf -v seq '%06d' "$i"
+    zf_rm -f -- "$users_dir/$seq" 2>/dev/null
+  done
+  umask "$old_umask"
 }
 
 # Load a session by ID
@@ -188,6 +255,7 @@ state_load_session() {
   MSG_THINKINGS=()
   MSG_THINKING_EXPANDED=()
   MSG_TIMES=()
+  MSG_MODELS=()
 
   local -i len=${mapfile[$session_dir/message_count]:-0} i
   local seq prefix
@@ -199,12 +267,29 @@ state_load_session() {
     MSG_THINKINGS+=("${mapfile[$prefix.thinking]}")
     MSG_THINKING_EXPANDED+=("${mapfile[$prefix.expanded]:-0}")
     MSG_TIMES+=("${mapfile[$prefix.time]}")
+    if [[ "${MSG_ROLES[-1]}" == assistant ]]; then
+      MSG_MODELS+=("${mapfile[$prefix.model]:-$SESSION_MODEL}")
+    else
+      MSG_MODELS+=("")
+    fi
   done
   CHAT_COMPACTION_SUMMARY="${mapfile[$session_dir/compaction_summary]}"
   CHAT_COMPACTION_COUNT="${mapfile[$session_dir/compaction_count]:-0}"
   CHAT_CONTEXT_START_INDEX="${mapfile[$session_dir/context_start_index]:-1}"
+  CHAT_COMPACTION_REARM_TOKENS="${mapfile[$session_dir/compaction_rearm_tokens]:-0}"
+  CHAT_LAST_PROMPT_TOKENS="${mapfile[$session_dir/last_prompt_tokens]:-0}"
+  CHAT_LAST_OUTPUT_TOKENS="${mapfile[$session_dir/last_output_tokens]:-0}"
+  CHAT_LAST_PAYLOAD_BYTES="${mapfile[$session_dir/last_payload_bytes]:-0}"
+  CHAT_LAST_USAGE_MODEL="${mapfile[$session_dir/last_usage_model]}"
+  CHAT_LAST_USAGE_HOST="${mapfile[$session_dir/last_usage_host]}"
+  CHAT_COMPACTION_REARM_MODEL="${mapfile[$session_dir/compaction_rearm_model]}"
+  CHAT_COMPACTION_REARM_HOST="${mapfile[$session_dir/compaction_rearm_host]}"
   [[ "$CHAT_COMPACTION_COUNT" == <0-> ]] || CHAT_COMPACTION_COUNT=0
   [[ "$CHAT_CONTEXT_START_INDEX" == <1-> ]] || CHAT_CONTEXT_START_INDEX=1
+  [[ "$CHAT_COMPACTION_REARM_TOKENS" == <0-> ]] || CHAT_COMPACTION_REARM_TOKENS=0
+  [[ "$CHAT_LAST_PROMPT_TOKENS" == <0-> ]] || CHAT_LAST_PROMPT_TOKENS=0
+  [[ "$CHAT_LAST_OUTPUT_TOKENS" == <0-> ]] || CHAT_LAST_OUTPUT_TOKENS=0
+  [[ "$CHAT_LAST_PAYLOAD_BYTES" == <0-> ]] || CHAT_LAST_PAYLOAD_BYTES=0
   (( CHAT_CONTEXT_START_INDEX <= len + 1 )) || CHAT_CONTEXT_START_INDEX=1
 
   local -i user_count="${mapfile[$session_dir/context_user_count]:-0}"
@@ -219,6 +304,7 @@ state_load_session() {
       [[ "${MSG_ROLES[i]}" == user ]] && CHAT_USER_MESSAGES+=("${MSG_CONTENTS[i]}")
     done
   fi
+  (( $+functions[render_invalidate] )) && render_invalidate
 }
 
 # Delete a session
@@ -244,6 +330,7 @@ state_append_message() {
   local thinking="${3:-}"
   local thinking_expanded="${4:-0}"
   local time_str="${5:-}"
+  local message_model="${6:-}"
   if [[ -z "$time_str" ]]; then
     zchat_time
     time_str="$REPLY"
@@ -254,6 +341,8 @@ state_append_message() {
   MSG_THINKINGS+=("$thinking")
   MSG_THINKING_EXPANDED+=("$thinking_expanded")
   MSG_TIMES+=("$time_str")
+  [[ "$role" == assistant && -z "$message_model" ]] && message_model="$SESSION_MODEL"
+  MSG_MODELS+=("$message_model")
   [[ "$role" == user ]] && CHAT_USER_MESSAGES+=("$content")
 
   # Auto-generate title from first user message if still "New Chat"
@@ -265,6 +354,32 @@ state_append_message() {
 
   state_save_session
   state_refresh_sessions_list
+  (( $+functions[render_invalidate] )) && render_invalidate
+}
+
+# Add the active assistant row in memory only. A cancelled or failed request
+# therefore never leaves an empty assistant message in persisted history.
+state_begin_streaming_message() {
+  MSG_ROLES+=("assistant")
+  MSG_CONTENTS+=("")
+  MSG_THINKINGS+=("")
+  MSG_THINKING_EXPANDED+=(1)
+  zchat_time
+  MSG_TIMES+=("$REPLY")
+  MSG_MODELS+=("$SESSION_MODEL")
+}
+
+state_discard_streaming_message() {
+  local -i expected="${1:-${#MSG_ROLES}}" count=${#MSG_ROLES}
+  (( count == expected && count > 0 )) || return 1
+  [[ "${MSG_ROLES[count]}" == assistant ]] || return 1
+  MSG_ROLES[-1]=()
+  MSG_CONTENTS[-1]=()
+  MSG_THINKINGS[-1]=()
+  MSG_THINKING_EXPANDED[-1]=()
+  MSG_TIMES[-1]=()
+  MSG_MODELS[-1]=()
+  (( $+functions[render_invalidate] )) && render_invalidate
 }
 
 # Fast in-memory update during streaming (no disk write)
@@ -272,10 +387,13 @@ state_update_streaming_message() {
   local content="$1"
   local thinking="${2:-}"
   local count=${#MSG_ROLES}
+  local previous_content=""
 
   if (( count > 0 )) && [[ "${MSG_ROLES[count]}" == "assistant" ]]; then
+    previous_content="${MSG_CONTENTS[count]}"
     MSG_CONTENTS[count]="$content"
     MSG_THINKINGS[count]="$thinking"
+    [[ -z "$previous_content" && -n "$content" && -n "$thinking" ]] && MSG_THINKING_EXPANDED[count]=0
   else
     MSG_ROLES+=("assistant")
     MSG_CONTENTS+=("$content")
@@ -283,6 +401,7 @@ state_update_streaming_message() {
     MSG_THINKING_EXPANDED+=(0)
     zchat_time
     MSG_TIMES+=("$REPLY")
+    MSG_MODELS+=("$SESSION_MODEL")
   fi
 }
 
@@ -302,14 +421,17 @@ state_set_last_assistant_message() {
     MSG_THINKING_EXPANDED+=(0)
     zchat_time
     MSG_TIMES+=("$REPLY")
+    MSG_MODELS+=("$SESSION_MODEL")
   fi
 
   state_save_session
+  (( $+functions[render_invalidate] )) && render_invalidate
 }
 
 # Toggle reasoning expansion on the latest assistant message with reasoning
 state_toggle_last_reasoning() {
   local count=${#MSG_ROLES}
+  local -i in_memory_only="${1:-0}"
   local i
   for (( i=count; i>=1; i-- )); do
     if [[ "${MSG_ROLES[i]}" == "assistant" && -n "${MSG_THINKINGS[i]}" ]]; then
@@ -318,7 +440,8 @@ state_toggle_last_reasoning() {
       else
         MSG_THINKING_EXPANDED[i]=1
       fi
-      state_save_session
+      (( in_memory_only )) || state_save_session
+      (( $+functions[render_invalidate] )) && render_invalidate
       return 0
     fi
   done

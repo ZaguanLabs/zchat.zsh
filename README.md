@@ -1,4 +1,4 @@
-# ⚡ zchat.zsh v1.0.3 — Native ZSH & Curses AI Terminal Interface
+# ⚡ zchat.zsh v1.0.4 — Native ZSH & Curses AI Terminal Interface
 
 > A full-screen, split-pane Terminal User Interface (TUI) AI chat client written in **pure ZSH**, connecting directly to **Ollama's Chat API** through Zsh's native TCP module with live token streaming, collapsible reasoning, and rich Markdown rendering.
 
@@ -52,7 +52,7 @@ See [System Requirements & Prerequisites](#-system-requirements--prerequisites) 
 
 ```
 ┌───────────────────────────────────────────────────────────────────────────┐
-│ ⚡ zchat.zsh v1.0.3 │ Model: gemma4:12b (localhost:11434)     [ Ready ]   │
+│ ⚡ zchat.zsh v1.0.4 │ Model: gemma4:12b (localhost:11434)     [ Ready ]   │
 ├───────────────┬───────────────────────────────────────────────────────────┤
 │ Sessions (3)  │  Chat Transcript (4 msgs)                                 │
 │ ▶ Hello World │  🧑 You  11:00                                            │
@@ -117,6 +117,7 @@ brew install zsh
 * **Immediate Feedback**: The moment you press Enter, a `▼ 💭 Thinking...` block appears in the chat transcript with an animated spinner in the header.
 * **Auto-Collapsing**: As soon as the main response starts arriving, the reasoning block collapses automatically into a compact single-line banner: `▶ 💭 Reasoning (N lines) [Press ^R to expand]`.
 * **Interactive Toggle (`Ctrl+R` / `/think`)**: Expand or collapse reasoning blocks anytime without disrupting your chat view.
+* **Fail-Closed Streaming**: Each response is bound to its originating session, malformed or incomplete streams surface an error, and cancelled requests leave no empty assistant placeholder.
 
 ### 2. Terminal Markdown & Syntax Engine
 * **Headings**: `# H1` (bold magenta), `## H2` (cyan), `### H3` (yellow), `#### H4` (white).
@@ -130,12 +131,14 @@ brew install zsh
 * **Header Bar**: Displays active model, Ollama endpoint, and animated status badges (`[ Thinking ⠋ ]`, `[ Streaming ⠋ ]`, `[ Ready ]`).
 * **Sidebar Pane**: Lists saved chat sessions with the active conversation highlighted.
 * **Chat Viewport**: Scrollable message transcript with automatic viewport scrolling during generation.
+* **Incremental Rendering**: Finalized messages are cached while only newly appended stream bytes and the active response are processed; terminal windows refresh as one frame.
 * **Multiline Prompt Editor**: A one-to-four-row cursor-following viewport with soft wrapping, hard newlines via `Shift+Enter` or `Alt+Enter`, vertical cursor movement, draft-preserving prompt history, and safe bracketed multiline paste.
 * **Footer Bar**: Live keybinding shortcuts and status hints.
 * **Dynamic Sizing**: Automatically adapts to window resizing (`SIGWINCH`) and gracefully scales on smaller terminal dimensions.
 
 ### 4. Session Persistence & Sidebar History
 * All sessions are saved automatically in native directory-backed storage under `~/.config/zchat/sessions/`.
+* Configuration, transcripts, and temporary request files are private to the current user by default (`0600` files in `0700` directories).
 * Switch between past conversations instantly from the sidebar using `Tab` and `↑`/`↓`.
 * Delete sessions directly with `d` or `x`.
 * Long conversations retain their complete visible transcript while the model receives a persisted compact checkpoint plus a bounded recent raw exchange.
@@ -216,9 +219,9 @@ chat.sh/
 
 ### Event Loop Flow
 1. **Input Polling**: `zcurses input` polls non-blocking with a 50ms timeout. Native event decoding recognizes Shift/Alt+Enter and bracketed paste.
-2. **Stream Processing**: A background Zsh worker uses `zsh/net/tcp`, `sysread`, and a native HTTP chunk decoder to consume Ollama's NDJSON stream into `.thinking` and `.content` spool files.
-3. **In-Memory Frame Updates**: As new tokens arrive, `lib/state.zsh` updates in-memory arrays and triggers `ui_refresh_all 1` without disk I/O lag.
-4. **Completion**: On stream finish, `state_save_session` persists the completed conversation, captures Ollama's prompt usage for token-estimate calibration, and transitions reasoning to collapsed state.
+2. **Stream Processing**: A background Zsh worker uses `zsh/net/tcp`, `sysread`, and a native HTTP chunk decoder to consume Ollama's NDJSON stream in a private runtime directory, publishing an explicit completion status.
+3. **Incremental Frame Updates**: The event loop reads only newly appended reasoning/content bytes, reuses the rendered transcript prefix, and batches curses windows into one terminal refresh at a throttled frame rate.
+4. **Completion**: Only a valid stream ending in Ollama's final `done:true` event is persisted. Prompt usage calibrates future context estimates; failures and cancellation discard the in-memory placeholder.
 
 ### Context Compaction
 
@@ -228,7 +231,7 @@ Compaction follows the continuation-checkpoint design used by `zcoder.zsh`, adap
 2. Automatic compaction starts at 85% of the allocated context by default. Change it with `--compact-at PERCENT` or `ZCHAT_COMPACT_PERCENT`.
 3. A non-streaming, non-thinking model turn creates a concise chat checkpoint, capped at the smaller of 2,048 tokens or 10% of the active context.
 4. The model context becomes that checkpoint plus a recent raw tail of the conversation. The full TUI transcript remains visible and saved.
-5. Checkpoints, the retained-tail boundary, and the bounded exact-user ledger are persisted with each session, so resumed conversations keep their compacted context.
+5. Checkpoints, the user-turn-aligned raw-tail boundary, token calibration, rearm threshold, and bounded non-duplicated exact-user ledger are persisted with each session, so resumed conversations keep their compacted context.
 
 Context sizing defaults to `auto`. If the selected model is loaded, zchat uses the allocation from Ollama's `/api/ps`; otherwise it starts with a 65,536-token fallback and refreshes after the first response. Use `--context-window TOKENS` or `ZCHAT_CONTEXT_WINDOW` to request a fixed allocation. Larger contexts consume more memory.
 
@@ -251,7 +254,7 @@ All user configuration and conversation histories are stored following the XDG B
   ```
 * **Saved Sessions**: `~/.config/zchat/sessions/<timestamp>_<id>.session/`
 
-Session fields and message bodies are stored as raw files inside each session directory and accessed through `zsh/mapfile`; no serialization subprocess is needed. Existing `.json` sessions are migrated automatically on startup and retained as backups.
+Session fields and message bodies are stored as raw files inside each session directory and accessed through `zsh/mapfile`; no serialization subprocess is needed. Files use mode `0600`, directories use `0700`, and metadata counts are written last as commit markers. Existing `.json` sessions are migrated automatically on startup, retained as backups, and secured on the next launch.
 
 ---
 

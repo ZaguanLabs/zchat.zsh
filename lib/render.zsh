@@ -5,9 +5,22 @@ setopt EXTENDED_GLOB 2>/dev/null
 typeset -ga RENDERED_LINES=()
 typeset -ga RENDERED_ATTRS=()
 typeset -ga RENDERED_SPANS=()
+typeset -ga RENDER_PREFIX_LINES=()
+typeset -ga RENDER_PREFIX_ATTRS=()
+typeset -ga RENDER_PREFIX_SPANS=()
+typeset -gi RENDER_REVISION=0
+typeset -gi RENDER_PREFIX_REVISION=-1
+typeset -gi RENDER_PREFIX_WIDTH=0
+typeset -gi RENDER_PREFIX_COUNT=-1
+typeset -g RENDER_PREFIX_SESSION=""
 
 typeset -g SPAN_SEP="~@~"
 typeset -g FIELD_SEP="~#~"
+
+render_invalidate() {
+  (( ++RENDER_REVISION ))
+  return 0
+}
 
 # Tokenize inline markdown (bold, italic, strikethrough, code, links) into a span string
 # Usage: _render_tokenize_inline "text" "default_attr"
@@ -179,20 +192,23 @@ _render_markdown_table() {
   _add_line "$bot_b" "dim cyan/black" 0
 }
 
-# Main markdown renderer for all conversation messages
-# Usage: render_messages <inner_width> [is_streaming]
-render_messages() {
+# Render one inclusive message range. Finalized messages can be cached while the
+# last assistant row changes during streaming.
+_render_message_range() {
   local width="${1:-60}"
   local is_streaming="${2:-0}"
+  local -i range_start="${3:-1}" range_end="${4:-${#MSG_ROLES}}" reset="${5:-1}"
   local text_width=$(( width - 4 ))
   (( text_width < 20 )) && text_width=20
 
-  RENDERED_LINES=()
-  RENDERED_ATTRS=()
-  RENDERED_SPANS=()
+  if (( reset )); then
+    RENDERED_LINES=()
+    RENDERED_ATTRS=()
+    RENDERED_SPANS=()
+  fi
 
-  local count=${#MSG_ROLES}
-  if (( count == 0 )); then
+  local count=$range_end total_count=${#MSG_ROLES}
+  if (( total_count == 0 && reset )); then
     _add_line " " "default/default" 0
     _add_line "  👋 Welcome to ZSH AI Chat!" "bold cyan/black" 0
     _add_line " " "default/default" 0
@@ -204,6 +220,7 @@ render_messages() {
     _add_line " " "default/default" 0
     return
   fi
+  (( range_start <= range_end )) || return 0
 
   local i=1 role="" content="" thinking="" tm="" exp=0
   local -a raw_lines=() wrapped=() think_raw=() table_buf=()
@@ -212,7 +229,7 @@ render_messages() {
   local hdr="" pad_len=0 bar="" num_prefix="" code_attr="" rbar=""
   local mark="" t_txt="" num="" num_txt="" first=1 b_txt=""
 
-  for (( i=1; i<=count; i++ )); do
+  for (( i=range_start; i<=range_end; i++ )); do
     role="${MSG_ROLES[i]}"
     content="${MSG_CONTENTS[i]}"
     thinking="${MSG_THINKINGS[i]:-}"
@@ -250,7 +267,7 @@ render_messages() {
         ;;
 
       assistant)
-        _add_line "🤖 Assistant (${SESSION_MODEL})  ${tm}" "bold cyan/black" 0
+        _add_line "🤖 Assistant (${MSG_MODELS[i]:-$SESSION_MODEL})  ${tm}" "bold cyan/black" 0
 
         # ----------------------------------------------------------------------
         # 1. Reasoning Block (Collapsible)
@@ -504,4 +521,38 @@ render_messages() {
         ;;
     esac
   done
+}
+
+# Main markdown renderer. During generation the immutable transcript prefix is
+# reused and only the active assistant message is parsed again.
+render_messages() {
+  local -i width="${1:-60}" is_streaming="${2:-0}" count=${#MSG_ROLES} prefix_count
+  if (( ! is_streaming || count == 0 )); then
+    _render_message_range "$width" 0 1 "$count" 1
+    return
+  fi
+
+  prefix_count=$(( count - 1 ))
+  if (( RENDER_PREFIX_REVISION != RENDER_REVISION || RENDER_PREFIX_WIDTH != width || RENDER_PREFIX_COUNT != prefix_count )) \
+    || [[ "$RENDER_PREFIX_SESSION" != "$CURRENT_SESSION_ID" ]]; then
+    if (( prefix_count > 0 )); then
+      _render_message_range "$width" 0 1 "$prefix_count" 1
+      RENDER_PREFIX_LINES=("${RENDERED_LINES[@]}")
+      RENDER_PREFIX_ATTRS=("${RENDERED_ATTRS[@]}")
+      RENDER_PREFIX_SPANS=("${RENDERED_SPANS[@]}")
+    else
+      RENDER_PREFIX_LINES=()
+      RENDER_PREFIX_ATTRS=()
+      RENDER_PREFIX_SPANS=()
+    fi
+    RENDER_PREFIX_REVISION=$RENDER_REVISION
+    RENDER_PREFIX_WIDTH=$width
+    RENDER_PREFIX_COUNT=$prefix_count
+    RENDER_PREFIX_SESSION="$CURRENT_SESSION_ID"
+  fi
+
+  RENDERED_LINES=("${RENDER_PREFIX_LINES[@]}")
+  RENDERED_ATTRS=("${RENDER_PREFIX_ATTRS[@]}")
+  RENDERED_SPANS=("${RENDER_PREFIX_SPANS[@]}")
+  _render_message_range "$width" 1 "$count" "$count" 0
 }

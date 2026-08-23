@@ -14,10 +14,14 @@ typeset -gi CHAT_CONTEXT_DISCOVERY_PENDING=0
 typeset -gi CHAT_LAST_PROMPT_TOKENS=0
 typeset -gi CHAT_LAST_OUTPUT_TOKENS=0
 typeset -gi CHAT_LAST_PAYLOAD_BYTES=0
+typeset -g CHAT_LAST_USAGE_MODEL=""
+typeset -g CHAT_LAST_USAGE_HOST=""
 typeset -gi CHAT_ESTIMATED_TOKENS=0
 typeset -gi CHAT_COMPACTION_COUNT=0
 typeset -gi CHAT_COMPACTION_IN_PROGRESS=0
 typeset -gi CHAT_COMPACTION_REARM_TOKENS=0
+typeset -g CHAT_COMPACTION_REARM_MODEL=""
+typeset -g CHAT_COMPACTION_REARM_HOST=""
 typeset -gi CHAT_CONTEXT_START_INDEX=1
 typeset -g CHAT_COMPACTION_SUMMARY=""
 typeset -g CHAT_COMPACTION_ERROR=""
@@ -40,10 +44,14 @@ chat_compaction_reset() {
   CHAT_LAST_PROMPT_TOKENS=0
   CHAT_LAST_OUTPUT_TOKENS=0
   CHAT_LAST_PAYLOAD_BYTES=0
+  CHAT_LAST_USAGE_MODEL=""
+  CHAT_LAST_USAGE_HOST=""
   CHAT_ESTIMATED_TOKENS=0
   CHAT_COMPACTION_COUNT=0
   CHAT_COMPACTION_IN_PROGRESS=0
   CHAT_COMPACTION_REARM_TOKENS=0
+  CHAT_COMPACTION_REARM_MODEL=""
+  CHAT_COMPACTION_REARM_HOST=""
   CHAT_CONTEXT_START_INDEX=1
   CHAT_COMPACTION_SUMMARY=""
   CHAT_COMPACTION_ERROR=""
@@ -53,12 +61,22 @@ chat_compaction_reset() {
 
 chat_context_configure() {
   [[ "$CHAT_CONTEXT_MODEL" == "$SESSION_MODEL" && "$CHAT_CONTEXT_HOST" == "$OLLAMA_HOST" ]] && return 0
+  local previous_model="$CHAT_CONTEXT_MODEL" previous_host="$CHAT_CONTEXT_HOST"
   CHAT_CONTEXT_MODEL="$SESSION_MODEL"
   CHAT_CONTEXT_HOST="$OLLAMA_HOST"
-  CHAT_LAST_PROMPT_TOKENS=0
-  CHAT_LAST_PAYLOAD_BYTES=0
   CHAT_CONTEXT_DISCOVERY_PENDING=0
-  CHAT_COMPACTION_REARM_TOKENS=0
+  # A loaded session has no in-process context identity yet, but its saved token
+  # calibration remains valid. Reset it only after an actual model/host switch.
+  if [[ -n "$previous_model$previous_host" ]]; then
+    CHAT_LAST_PROMPT_TOKENS=0
+    CHAT_LAST_OUTPUT_TOKENS=0
+    CHAT_LAST_PAYLOAD_BYTES=0
+    CHAT_COMPACTION_REARM_TOKENS=0
+    CHAT_LAST_USAGE_MODEL=""
+    CHAT_LAST_USAGE_HOST=""
+    CHAT_COMPACTION_REARM_MODEL=""
+    CHAT_COMPACTION_REARM_HOST=""
+  fi
 
   if [[ "$ZCHAT_CONTEXT_WINDOW" == <4096-> ]]; then
     CHAT_CONTEXT_WINDOW="$ZCHAT_CONTEXT_WINDOW"
@@ -86,7 +104,10 @@ chat_context_refresh_after_response() {
 
 chat_compaction_limit() {
   local -i limit=$(( CHAT_CONTEXT_WINDOW * ZCHAT_COMPACT_PERCENT / 100 ))
-  (( CHAT_COMPACTION_REARM_TOKENS > limit )) && limit=$CHAT_COMPACTION_REARM_TOKENS
+  if [[ "$CHAT_COMPACTION_REARM_MODEL" == "$SESSION_MODEL" && "$CHAT_COMPACTION_REARM_HOST" == "$OLLAMA_HOST" ]] \
+    && (( CHAT_COMPACTION_REARM_TOKENS > limit )); then
+    limit=$CHAT_COMPACTION_REARM_TOKENS
+  fi
   (( limit > CHAT_CONTEXT_WINDOW * 95 / 100 )) && limit=$(( CHAT_CONTEXT_WINDOW * 95 / 100 ))
   REPLY="$limit"
 }
@@ -103,7 +124,8 @@ chat_estimate_payload_tokens() {
   local -i bytes estimate
   _api_byte_length "$payload"
   bytes=$REPLY
-  if (( CHAT_LAST_PROMPT_TOKENS > 0 && CHAT_LAST_PAYLOAD_BYTES > 0 )); then
+  if (( CHAT_LAST_PROMPT_TOKENS > 0 && CHAT_LAST_PAYLOAD_BYTES > 0 )) \
+    && [[ "$CHAT_LAST_USAGE_MODEL" == "$SESSION_MODEL" && "$CHAT_LAST_USAGE_HOST" == "$OLLAMA_HOST" ]]; then
     estimate=$(( (bytes * CHAT_LAST_PROMPT_TOKENS + CHAT_LAST_PAYLOAD_BYTES - 1) / CHAT_LAST_PAYLOAD_BYTES ))
     estimate=$(( (estimate * 110 + 99) / 100 ))
   else
@@ -121,7 +143,7 @@ chat_context_options_json() {
 }
 
 chat_build_compaction_payload() {
-  local -i start="${1:-$CHAT_CONTEXT_START_INDEX}" i length remaining
+  local -i start="${1:-$CHAT_CONTEXT_START_INDEX}" i length remaining raw_user_count=0 ledger_end
   local -i user_budget=$(( CHAT_CONTEXT_WINDOW / 10 ))
   local records="[" comma="" ledger="[" ledger_comma="" source_text="" role_json="" content_json="" message=""
   local system_json="" user_json="" model_json="" options=""
@@ -129,6 +151,7 @@ chat_build_compaction_payload() {
   for (( i=start; i<=${#MSG_ROLES}; i++ )); do
     [[ "${MSG_ROLES[i]}" == user || "${MSG_ROLES[i]}" == assistant ]] || continue
     [[ -n "${MSG_CONTENTS[i]}" ]] || continue
+    [[ "${MSG_ROLES[i]}" == user ]] && (( raw_user_count++ ))
     json_quote "${MSG_ROLES[i]}"; role_json="$REPLY"
     json_quote "${MSG_CONTENTS[i]}"; content_json="$REPLY"
     records+="${comma}{\"role\":${role_json},\"content\":${content_json}}"
@@ -142,7 +165,11 @@ chat_build_compaction_payload() {
   (( user_budget > ZCHAT_COMPACT_KEEP_USER_TOKENS )) && user_budget=$ZCHAT_COMPACT_KEEP_USER_TOKENS
   remaining=$(( user_budget * 3 ))
   local -a ledger_items=()
-  for (( i=${#CHAT_USER_MESSAGES}; i>=1 && remaining>0; i-- )); do
+  # The raw tail already carries its user messages verbatim. Reserve the exact
+  # ledger for older requests instead of paying for the same text twice.
+  ledger_end=$(( ${#CHAT_USER_MESSAGES} - raw_user_count ))
+  (( ledger_end < 0 )) && ledger_end=0
+  for (( i=ledger_end; i>=1 && remaining>0; i-- )); do
     message="${CHAT_USER_MESSAGES[i]}"
     length=${#message}
     if (( length > remaining )); then
@@ -189,6 +216,9 @@ chat_compaction_replace_history() {
     start=$i
     (( remaining -= length ))
   done
+  while (( start <= ${#MSG_ROLES} )) && [[ "${MSG_ROLES[start]}" != user ]]; do
+    (( start++ ))
+  done
 
   (( user_budget < 256 )) && user_budget=256
   (( user_budget > ZCHAT_COMPACT_KEEP_USER_TOKENS )) && user_budget=$ZCHAT_COMPACT_KEEP_USER_TOKENS
@@ -234,6 +264,9 @@ chat_compact_history() {
     estimate=$REPLY
     (( estimate <= hard_limit || start >= count )) && break
     (( start++ ))
+    while (( start < count )) && [[ "${MSG_ROLES[start]}" != user ]]; do
+      (( start++ ))
+    done
   done
 
   if (( $+functions[ui_wait_for_compaction] )); then
@@ -294,6 +327,8 @@ chat_compact_history() {
   chat_estimate_payload_tokens "$REPLY"
   after=$REPLY
   CHAT_COMPACTION_REARM_TOKENS=$(( after + CHAT_CONTEXT_WINDOW / 10 ))
+  CHAT_COMPACTION_REARM_MODEL="$SESSION_MODEL"
+  CHAT_COMPACTION_REARM_HOST="$OLLAMA_HOST"
   (( start > original_start )) && dropped_note="; omitted old detailed records from the checkpoint request to fit the window"
   (( after >= before )) && size_note="; the conversation was already small, so the checkpoint did not reduce its estimated size"
   state_append_message system "♻ Compacted context (${trigger}): approximately ${before} → ${after} tokens; checkpoint ${CHAT_COMPACTION_COUNT}${dropped_note}${size_note}."
@@ -328,6 +363,8 @@ chat_record_response_usage() {
   CHAT_LAST_PAYLOAD_BYTES="$REPLY"
   CHAT_LAST_PROMPT_TOKENS="$prompt_tokens"
   CHAT_LAST_OUTPUT_TOKENS="$output_tokens"
+  CHAT_LAST_USAGE_MODEL="$SESSION_MODEL"
+  CHAT_LAST_USAGE_HOST="$OLLAMA_HOST"
   chat_context_refresh_after_response
 }
 

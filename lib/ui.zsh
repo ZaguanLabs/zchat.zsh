@@ -146,7 +146,8 @@ ui_destroy_windows() {
 
 # Render the Top Header Bar
 ui_draw_header() {
-  local stat_val="${1:-$UI_STATUS_TEXT}"
+  local -i defer_refresh="${1:-0}"
+  local stat_val="$UI_STATUS_TEXT"
   local status_str="[ ${stat_val} ]"
   local status_x=$(( SCREEN_W - ${#status_str} - 3 ))
 
@@ -183,12 +184,13 @@ ui_draw_header() {
     zcurses string top_win "$status_str"
   fi
 
-  zcurses refresh top_win
+  (( defer_refresh )) || zcurses refresh top_win
 }
 
 # Render the Sidebar
 ui_draw_sidebar() {
   (( SIDE_W <= 0 )) && return
+  local -i defer_refresh="${1:-0}"
 
   local inner_h=$(( SCREEN_H - 3 - INPUT_H - 1 - 2 ))
   local inner_w=$(( SIDE_W - 2 ))
@@ -239,12 +241,13 @@ ui_draw_sidebar() {
     zcurses string side_win " ^O: Models"
   fi
 
-  zcurses refresh side_win
+  (( defer_refresh )) || zcurses refresh side_win
 }
 
 # Render the Chat Viewport
 ui_draw_chat() {
   local is_stream="${1:-0}"
+  local -i defer_refresh="${2:-0}"
   local chat_inner_w=$(( SCREEN_W - SIDE_W - 2 ))
   local chat_inner_h=$(( SCREEN_H - 3 - INPUT_H - 1 - 2 ))
 
@@ -337,7 +340,7 @@ ui_draw_chat() {
     zcurses string chat_win " [▲ Scrolled Up] "
   fi
 
-  zcurses refresh chat_win
+  (( defer_refresh )) || zcurses refresh chat_win
 }
 
 # Render the multiline, cursor-following prompt editor.
@@ -404,6 +407,7 @@ ui_input_changed() {
 
 # Render the Bottom Footer Bar
 ui_draw_footer() {
+  local -i defer_refresh="${1:-0}"
   local bar_str=" Enter Send  S/M-Enter Newline  ^O Model  ^R Reason  ^N New  PgUp/Dn Scroll  ^Q Quit" padded=""
   zcurses clear foot_win
   zcurses attr foot_win reverse dim white/black
@@ -412,15 +416,29 @@ ui_draw_footer() {
   zcurses move foot_win 0 0
   zcurses string foot_win "$padded"
   zcurses attr foot_win -reverse default/default
-  zcurses refresh foot_win
+  (( defer_refresh )) || zcurses refresh foot_win
 }
 
 # Full UI refresh
 ui_refresh_all() {
   local is_stream="${1:-0}"
-  ui_draw_header
-  (( SIDE_W > 0 )) && ui_draw_sidebar
-  ui_draw_chat $is_stream
-  ui_draw_input
-  ui_draw_footer
+  local -a windows=(top_win)
+  ui_draw_header 1
+  if (( SIDE_W > 0 )); then
+    ui_draw_sidebar 1
+    windows+=(side_win)
+  fi
+  ui_draw_chat "$is_stream" 1
+  ui_draw_input 1
+  ui_draw_footer 1
+  windows+=(chat_win input_win foot_win)
+  zcurses refresh "${windows[@]}"
+}
+
+# Streaming changes only the status badge and transcript. Avoid repainting the
+# sidebar, prompt, and footer for every visual frame.
+ui_refresh_stream() {
+  ui_draw_header 1
+  ui_draw_chat 1 1
+  zcurses refresh top_win chat_win
 }

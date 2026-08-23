@@ -11,7 +11,7 @@ zmodload zsh/curses zsh/datetime zsh/files zsh/mapfile zsh/net/tcp \
 }
 
 typeset -gr ZCHAT_NAME="zchat.zsh"
-typeset -gr ZCHAT_VERSION="1.0.3"
+typeset -gr ZCHAT_VERSION="1.0.4"
 typeset -gr ZCHAT_DEFAULT_OLLAMA_HOST="localhost:11434"
 typeset -g ZCHAT_HOST_OVERRIDE=0
 typeset -g ZCHAT_MODEL_OVERRIDE=0
@@ -92,10 +92,15 @@ done
 # Runtime state
 typeset -g RUNNING=1
 typeset -g STREAM_PID=""
-typeset -g STREAM_BASE_FILE="/tmp/zchat_stream_$$"
+typeset -g STREAM_BASE_FILE=""
 typeset -g STREAM_LAST_CONTENT=""
 typeset -g STREAM_LAST_THINKING=""
 typeset -g STREAM_PAYLOAD=""
+typeset -g STREAM_SESSION_ID=""
+typeset -gi STREAM_MESSAGE_INDEX=0
+typeset -gi STREAM_DIRTY=0
+typeset -gF STREAM_NEXT_RENDER=0.0
+typeset -grF STREAM_RENDER_INTERVAL=0.08
 typeset -ga SPINNER_CHARS=('⠋' '⠙' '⠹' '⠸' '⠼' '⠴' '⠦' '⠧' '⠇' '⠏')
 typeset -g SPINNER_IDX=1
 
@@ -104,7 +109,7 @@ cleanup() {
   RUNNING=0
   api_stop_stream "$STREAM_PID"
   [[ -n "$API_ASYNC_PID" ]] && api_async_cancel
-  zf_rm -f "${STREAM_BASE_FILE}"* 2>/dev/null
+  api_runtime_cleanup
   ui_destroy_windows
   zcurses end 2>/dev/null
   print -rn -- $'\e[?2004l' > /dev/tty 2>/dev/null
@@ -114,7 +119,15 @@ trap cleanup EXIT INT TERM HUP
 
 # Main Application Initialization
 main() {
-  state_init
+  if ! api_runtime_init; then
+    print -r -- "Error: ${API_HTTP_ERROR:-could not initialize private runtime storage}" >&2
+    return 1
+  fi
+  STREAM_BASE_FILE="${API_RUNTIME_DIR}/stream"
+  if ! state_init; then
+    print -r -- "Error: could not initialize ${ZCHAT_CONFIG_DIR}" >&2
+    return 1
+  fi
   input_init
 
   zcurses init
@@ -126,13 +139,12 @@ main() {
   # Pre-declare all function-scoped variables
   local ch="" key="" mouse=""
   local cur_ch="" cur_key=""
-  local raw_stream="" final_content=""
-  local raw_thinking="" raw_content=""
-  local t_file="${STREAM_BASE_FILE}.thinking"
-  local c_file="${STREAM_BASE_FILE}.content"
+  local stream_error=""
   local done_file="${STREAM_BASE_FILE}.done"
   local usage_file="${STREAM_BASE_FILE}.usage"
   local usage_line="" prompt_tokens="0" output_tokens="0"
+  local -i stream_status=0
+  local -F stream_now=0.0
   local prompt_text="" payload=""
   local curr_idx=1 i=1
 
@@ -144,59 +156,71 @@ main() {
     # --------------------------------------------------------------------------
     if [[ -n "$STREAM_PID" ]]; then
       SPINNER_IDX=$(( (SPINNER_IDX % ${#SPINNER_CHARS}) + 1 ))
+      stream_now=$EPOCHREALTIME
 
       if [[ -f "$done_file" ]] || ! kill -0 "$STREAM_PID" 2>/dev/null; then
         # Generation completed
-        zchat_read_file "$t_file"
-        raw_thinking="$REPLY"
-        zchat_read_file "$c_file"
-        raw_content="$REPLY"
-        state_set_last_assistant_message "$raw_content" "$raw_thinking"
+        api_stream_read_updates || true
+        STREAM_LAST_THINKING+="$API_STREAM_THINKING_DELTA"
+        STREAM_LAST_CONTENT+="$API_STREAM_CONTENT_DELTA"
+        state_update_streaming_message "$STREAM_LAST_CONTENT" "$STREAM_LAST_THINKING"
+        api_stream_collect "$STREAM_PID" "$STREAM_BASE_FILE"
+        stream_status=$?
+        stream_error="$API_STREAM_ERROR"
+        api_stream_close_readers
 
-        zchat_read_file "$usage_file"
-        usage_line="$REPLY"
-        if [[ "$usage_line" == <0->' '*<0->* ]]; then
-          prompt_tokens="${usage_line%% *}"
-          output_tokens="${${usage_line#* }%%$'\n'*}"
+        if (( stream_status == 0 && ${#MSG_ROLES} == STREAM_MESSAGE_INDEX )) \
+          && [[ "$CURRENT_SESSION_ID" == "$STREAM_SESSION_ID" ]]; then
+          zchat_read_file "$usage_file"
+          usage_line="$REPLY"
+          if [[ "$usage_line" == <0->' '*<0->* ]]; then
+            prompt_tokens="${usage_line%% *}"
+            output_tokens="${${usage_line#* }%%$'\n'*}"
+          else
+            prompt_tokens=0
+            output_tokens=0
+          fi
+          chat_record_response_usage "$STREAM_PAYLOAD" "$prompt_tokens" "$output_tokens"
+          state_set_last_assistant_message "$STREAM_LAST_CONTENT" "$STREAM_LAST_THINKING"
+          UI_STATUS_TEXT="Ready"
         else
-          prompt_tokens=0
-          output_tokens=0
+          if [[ "$CURRENT_SESSION_ID" == "$STREAM_SESSION_ID" ]]; then
+            state_discard_streaming_message "$STREAM_MESSAGE_INDEX" || true
+            state_append_message "system" "Response failed: ${stream_error:-request ownership changed before completion}"
+          fi
+          UI_STATUS_TEXT="Error"
         fi
-        chat_record_response_usage "$STREAM_PAYLOAD" "$prompt_tokens" "$output_tokens"
 
         STREAM_PID=""
         STREAM_PAYLOAD=""
+        STREAM_SESSION_ID=""
+        STREAM_MESSAGE_INDEX=0
         STREAM_LAST_THINKING=""
         STREAM_LAST_CONTENT=""
+        STREAM_DIRTY=0
         zf_rm -f "${STREAM_BASE_FILE}"* 2>/dev/null
-        UI_STATUS_TEXT="Ready"
         ui_refresh_all 0
 
-      elif [[ -f "$t_file" || -f "$c_file" ]]; then
-        zchat_read_file "$t_file"
-        raw_thinking="$REPLY"
-        zchat_read_file "$c_file"
-        raw_content="$REPLY"
-
-        if [[ "$raw_thinking" != "$STREAM_LAST_THINKING" || "$raw_content" != "$STREAM_LAST_CONTENT" ]]; then
-          STREAM_LAST_THINKING="$raw_thinking"
-          STREAM_LAST_CONTENT="$raw_content"
-          state_update_streaming_message "$raw_content" "$raw_thinking"
-
-          if [[ -z "$raw_content" ]]; then
-            UI_STATUS_TEXT="Thinking ${SPINNER_CHARS[SPINNER_IDX]}"
-          else
-            UI_STATUS_TEXT="Streaming ${SPINNER_CHARS[SPINNER_IDX]}"
-          fi
-          ui_refresh_all 1
+      else
+        if api_stream_read_updates; then
+          STREAM_LAST_THINKING+="$API_STREAM_THINKING_DELTA"
+          STREAM_LAST_CONTENT+="$API_STREAM_CONTENT_DELTA"
+          state_update_streaming_message "$STREAM_LAST_CONTENT" "$STREAM_LAST_THINKING"
+          STREAM_DIRTY=1
+        fi
+        if [[ -z "$STREAM_LAST_CONTENT" ]]; then
+          UI_STATUS_TEXT="Thinking ${SPINNER_CHARS[SPINNER_IDX]}"
         else
-          # Keep spinner animating in header
-          if [[ -z "$raw_content" ]]; then
-            UI_STATUS_TEXT="Thinking ${SPINNER_CHARS[SPINNER_IDX]}"
+          UI_STATUS_TEXT="Streaming ${SPINNER_CHARS[SPINNER_IDX]}"
+        fi
+        if (( stream_now >= STREAM_NEXT_RENDER )); then
+          STREAM_NEXT_RENDER=$(( stream_now + STREAM_RENDER_INTERVAL ))
+          if (( STREAM_DIRTY )); then
+            ui_refresh_stream
+            STREAM_DIRTY=0
           else
-            UI_STATUS_TEXT="Streaming ${SPINNER_CHARS[SPINNER_IDX]}"
+            ui_draw_header
           fi
-          ui_draw_header
         fi
       fi
     fi
@@ -251,8 +275,16 @@ main() {
     elif [[ "$cur_ch" == $'\x03' ]]; then
       if [[ -n "$STREAM_PID" ]]; then
         api_stop_stream "$STREAM_PID"
+        if [[ "$CURRENT_SESSION_ID" == "$STREAM_SESSION_ID" ]]; then
+          state_discard_streaming_message "$STREAM_MESSAGE_INDEX" || true
+        fi
         STREAM_PID=""
         STREAM_PAYLOAD=""
+        STREAM_SESSION_ID=""
+        STREAM_MESSAGE_INDEX=0
+        STREAM_LAST_THINKING=""
+        STREAM_LAST_CONTENT=""
+        STREAM_DIRTY=0
         zf_rm -f "${STREAM_BASE_FILE}"* 2>/dev/null
         UI_STATUS_TEXT="Stopped"
         state_append_message "system" "⏹ Response generation cancelled."
@@ -264,29 +296,49 @@ main() {
 
     # Ctrl+R (^R = \x12): Toggle Reasoning block expansion
     elif [[ "$cur_ch" == $'\x12' ]]; then
-      state_toggle_last_reasoning
-      ui_draw_chat 0
+      if [[ -n "$STREAM_PID" ]]; then
+        state_toggle_last_reasoning 1
+        ui_draw_chat 1
+      else
+        state_toggle_last_reasoning
+        ui_draw_chat 0
+      fi
 
     # Ctrl+N (^N = \x0e): New chat session
     elif [[ "$cur_ch" == $'\x0e' ]]; then
-      state_new_session "$SESSION_MODEL" "$SESSION_SYSTEM_PROMPT"
-      CHAT_SCROLL_OFFSET=0
-      CHAT_AUTO_SCROLL=1
-      input_reset
-      ui_setup_windows
-      ui_refresh_all 0
+      if [[ -n "$STREAM_PID" ]]; then
+        UI_STATUS_TEXT="Wait for response"
+        ui_draw_header
+      else
+        state_new_session "$SESSION_MODEL" "$SESSION_SYSTEM_PROMPT"
+        CHAT_SCROLL_OFFSET=0
+        CHAT_AUTO_SCROLL=1
+        input_reset
+        ui_setup_windows
+        ui_refresh_all 0
+      fi
 
     # Ctrl+O (^O = \x0f): Switch model dialog
     elif [[ "$cur_ch" == $'\x0f' ]]; then
-      modal_select_model
-      ui_setup_windows
-      ui_refresh_all 0
+      if [[ -n "$STREAM_PID" ]]; then
+        UI_STATUS_TEXT="Wait for response"
+        ui_draw_header
+      else
+        modal_select_model
+        ui_setup_windows
+        ui_refresh_all 0
+      fi
 
     # Ctrl+S (^S = \x13): System prompt presets dialog
     elif [[ "$cur_ch" == $'\x13' ]]; then
-      modal_system_prompt
-      ui_setup_windows
-      ui_refresh_all 0
+      if [[ -n "$STREAM_PID" ]]; then
+        UI_STATUS_TEXT="Wait for response"
+        ui_draw_header
+      else
+        modal_system_prompt
+        ui_setup_windows
+        ui_refresh_all 0
+      fi
 
     # Ctrl+H (^H = \x08 / \x7f with mod) or F1: Help modal
     elif [[ "$cur_ch" == $'\x08' || "$cur_key" == "F1" ]]; then
@@ -334,7 +386,10 @@ main() {
     # 4. Sidebar Focus Navigation
     # --------------------------------------------------------------------------
     elif [[ "$FOCUS_PANE" == "sidebar" ]]; then
-      if [[ "$cur_key" == "UP" || "$cur_ch" == "k" ]]; then
+      if [[ -n "$STREAM_PID" ]]; then
+        UI_STATUS_TEXT="Wait for response"
+        ui_draw_header
+      elif [[ "$cur_key" == "UP" || "$cur_ch" == "k" ]]; then
         curr_idx=1
         for (( i=1; i<=${#SESSION_IDS}; i++ )); do
           [[ "${SESSION_IDS[i]}" == "$CURRENT_SESSION_ID" ]] && { curr_idx=$i; break }
@@ -367,6 +422,11 @@ main() {
     elif [[ "$FOCUS_PANE" == "input" ]]; then
       # Enter: Dispatch prompt
       if [[ "$cur_ch" == $'\n' || "$cur_ch" == $'\r' || "$cur_key" == "ENTER" || "$cur_key" == "PADENTER" ]]; then
+        if [[ -n "$STREAM_PID" ]]; then
+          UI_STATUS_TEXT="Wait for response"
+          ui_draw_header
+          continue
+        fi
         input_submit
         prompt_text="$INPUT_SUBMITTED"
         ui_input_changed
@@ -471,16 +531,30 @@ main() {
               payload="$REPLY"
 
               # 3. Create initial assistant message for UI (expanded thinking mode)
-              state_append_message "assistant" "" "" 1
+              state_begin_streaming_message
 
               CHAT_AUTO_SCROLL=1
               UI_STATUS_TEXT="Thinking ⠋"
               ui_refresh_all 1
 
               # 4. Start background streaming
-              api_start_stream "$OLLAMA_HOST" "$payload" "$STREAM_BASE_FILE"
-              STREAM_PID="$API_STREAM_PID"
-              STREAM_PAYLOAD="$payload"
+              if api_start_stream "$OLLAMA_HOST" "$payload" "$STREAM_BASE_FILE" \
+                && api_stream_open_readers "$STREAM_BASE_FILE"; then
+                STREAM_PID="$API_STREAM_PID"
+                STREAM_PAYLOAD="$payload"
+                STREAM_SESSION_ID="$CURRENT_SESSION_ID"
+                STREAM_MESSAGE_INDEX=${#MSG_ROLES}
+                STREAM_LAST_THINKING=""
+                STREAM_LAST_CONTENT=""
+                STREAM_DIRTY=0
+                STREAM_NEXT_RENDER=$(( EPOCHREALTIME + STREAM_RENDER_INTERVAL ))
+              else
+                api_stop_stream "$API_STREAM_PID"
+                state_discard_streaming_message "${#MSG_ROLES}" || true
+                state_append_message "system" "Could not start the response: ${API_STREAM_ERROR:-could not open stream handoff files}"
+                UI_STATUS_TEXT="Error"
+                ui_refresh_all 0
+              fi
               ;;
           esac
         fi

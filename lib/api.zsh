@@ -2,6 +2,15 @@
 
 typeset -g OLLAMA_HOST="${OLLAMA_HOST:-${ZCHAT_DEFAULT_OLLAMA_HOST:-localhost:11434}}"
 typeset -g API_STREAM_PID=""
+typeset -g API_STREAM_ERROR=""
+typeset -gi API_STREAM_STATUS=1
+typeset -g API_STREAM_THINKING_DELTA=""
+typeset -g API_STREAM_CONTENT_DELTA=""
+typeset -gi API_STREAM_SAW_DONE=0
+typeset -gi API_STREAM_THINK_FD=-1
+typeset -gi API_STREAM_CONTENT_FD=-1
+typeset -g API_RUNTIME_DIR=""
+typeset -g API_RUNTIME_ROOT=""
 typeset -g API_HTTP_BODY=""
 typeset -g API_NET_HOST=""
 typeset -g API_NET_PORT="11434"
@@ -11,6 +20,38 @@ typeset -gi API_RUNNING_CONTEXT=0
 typeset -g API_ASYNC_PID=""
 typeset -g API_ASYNC_BASE=""
 typeset -ga API_MODELS=()
+
+# Create one private runtime directory for all request handoff files. Using an
+# atomically-created directory avoids predictable /tmp files and symlink races.
+api_runtime_init() {
+  [[ -n "$API_RUNTIME_DIR" && -d "$API_RUNTIME_DIR" ]] && return 0
+  local old_umask="$(umask)" candidate="" root="${${TMPDIR:-/tmp}:A}"
+  local -i attempt
+  umask 077
+  for (( attempt=1; attempt<=20; attempt++ )); do
+    candidate="${root}/zchat-${sysparams[pid]:-$$}-${EPOCHREALTIME//./_}-${RANDOM}"
+    if zf_mkdir "$candidate" 2>/dev/null; then
+      zf_chmod 700 "$candidate" 2>/dev/null || true
+      API_RUNTIME_ROOT="$root"
+      API_RUNTIME_DIR="$candidate"
+      umask "$old_umask"
+      return 0
+    fi
+  done
+  umask "$old_umask"
+  API_HTTP_ERROR="Could not create a private runtime directory"
+  return 1
+}
+
+api_runtime_cleanup() {
+  api_stream_close_readers
+  if [[ -n "$API_RUNTIME_DIR" && -n "$API_RUNTIME_ROOT" && -d "$API_RUNTIME_DIR" \
+    && "${API_RUNTIME_DIR:h}" == "$API_RUNTIME_ROOT" && "${API_RUNTIME_DIR:t}" == zchat-* ]]; then
+    zf_rm -rf -- "$API_RUNTIME_DIR" 2>/dev/null
+  fi
+  API_RUNTIME_DIR=""
+  API_RUNTIME_ROOT=""
+}
 
 # Accept either host:port or an http:// URL and return a canonical endpoint in
 # REPLY. The native transport intentionally supports plain HTTP only.
@@ -192,7 +233,8 @@ api_async_cleanup() {
 # active, allowing Escape/Ctrl+C, scrolling, and resize handling to continue.
 api_async_start() {
   local method="$1" path="$2" payload="${3:-}" endpoint="${4:-$OLLAMA_HOST}"
-  local base="${TMPDIR:-/tmp}/zchat_http_${$}_${EPOCHREALTIME//./_}_${RANDOM}"
+  api_runtime_init || return 1
+  local base="${API_RUNTIME_DIR}/http_${EPOCHREALTIME//./_}_${RANDOM}"
   API_HTTP_ERROR=""
   if [[ -n "$API_ASYNC_PID" ]] && kill -0 "$API_ASYNC_PID" 2>/dev/null; then
     API_HTTP_ERROR="An Ollama request is already running"
@@ -266,6 +308,7 @@ _api_process_event_line() {
     return 1
   fi
   if (( JSON_MESSAGE_DONE )); then
+    API_STREAM_SAW_DONE=1
     print -r -u "$ufd" -- "${JSON_MESSAGE_PROMPT_TOKENS} ${JSON_MESSAGE_OUTPUT_TOKENS}"
   fi
 
@@ -311,7 +354,7 @@ _api_consume_ndjson() {
     line="${API_NDJSON_BUFFER%%$'\n'*}"
     API_NDJSON_BUFFER="${API_NDJSON_BUFFER[$(( ${#line} + 2 )),-1]}"
     line="${line%$'\r'}"
-    _api_process_event_line "$line" "$tfd" "$cfd" "$efd" "$ufd"
+    _api_process_event_line "$line" "$tfd" "$cfd" "$efd" "$ufd" || return 1
   done
 }
 
@@ -327,6 +370,7 @@ _api_http_stream() {
 
   API_NDJSON_BUFFER=""
   API_IN_THINK_TAG=0
+  API_STREAM_SAW_DONE=0
   exec {tfd}>"$t_file" {cfd}>"$c_file" {efd}>>"$err_file" {ufd}>"$usage_file" || return 1
 
   _api_split_host "$endpoint"
@@ -382,20 +426,36 @@ _api_http_stream() {
         data="${wire[1,$expected]}"
         wire="${wire[$(( expected + 3 )),-1]}"
         expected=-1
-        _api_consume_ndjson "$data" "$tfd" "$cfd" "$efd" "$ufd"
+        _api_consume_ndjson "$data" "$tfd" "$cfd" "$efd" "$ufd" || {
+          ztcp -c "$fd" 2>/dev/null
+          return 1
+        }
+        (( API_STREAM_SAW_DONE )) && break 2
       done
     else
       data="$wire"
       wire=""
-      _api_consume_ndjson "$data" "$tfd" "$cfd" "$efd" "$ufd"
+      _api_consume_ndjson "$data" "$tfd" "$cfd" "$efd" "$ufd" || {
+        ztcp -c "$fd" 2>/dev/null
+        return 1
+      }
+      (( API_STREAM_SAW_DONE )) && break
     fi
   done
 
   ztcp -c "$fd" 2>/dev/null
   if [[ -n "$API_NDJSON_BUFFER" ]]; then
-    _api_process_event_line "${API_NDJSON_BUFFER%$'\r'}" "$tfd" "$cfd" "$efd" "$ufd"
+    _api_process_event_line "${API_NDJSON_BUFFER%$'\r'}" "$tfd" "$cfd" "$efd" "$ufd" || return 1
   fi
   exec {tfd}>&- {cfd}>&- {efd}>&- {ufd}>&-
+  if (( ! headers_done )); then
+    mapfile[$err_file]="Ollama returned an incomplete HTTP response"
+    return 1
+  fi
+  if (( ! API_STREAM_SAW_DONE )); then
+    mapfile[$err_file]="Ollama closed the response before its final event"
+    return 1
+  fi
 }
 
 # Start a background chat stream. The PID is returned through API_STREAM_PID.
@@ -408,25 +468,94 @@ api_start_stream() {
   local done_file="${base_file}.done"
   local err_file="${base_file}.err"
   local usage_file="${base_file}.usage"
+  local status_file="${base_file}.status"
+
+  API_STREAM_ERROR=""
+  API_STREAM_STATUS=1
+  if [[ -n "$API_STREAM_PID" ]] && kill -0 "$API_STREAM_PID" 2>/dev/null; then
+    API_STREAM_ERROR="An Ollama response is already running"
+    return 1
+  fi
 
   : > "$t_file"
   : > "$c_file"
   zf_rm -f "$done_file"
   : > "$err_file"
   : > "$usage_file"
+  : > "$status_file"
 
   (
-    _api_http_stream "$host" "$payload" "$t_file" "$c_file" "$err_file" "$usage_file"
+    trap - EXIT
+    local -i stream_status=0
+    _api_http_stream "$host" "$payload" "$t_file" "$c_file" "$err_file" "$usage_file" || stream_status=$?
+    mapfile[$status_file]="$stream_status"
     print -r -- "DONE" > "$done_file"
+    exit "$stream_status"
   ) </dev/null >/dev/null &
 
   API_STREAM_PID=$!
+}
+
+api_stream_open_readers() {
+  local base_file="$1"
+  api_stream_close_readers
+  exec {API_STREAM_THINK_FD}<"${base_file}.thinking" || return 1
+  exec {API_STREAM_CONTENT_FD}<"${base_file}.content" || {
+    exec {API_STREAM_THINK_FD}>&-
+    API_STREAM_THINK_FD=-1
+    return 1
+  }
+}
+
+api_stream_close_readers() {
+  (( API_STREAM_THINK_FD >= 0 )) && exec {API_STREAM_THINK_FD}>&- 2>/dev/null
+  (( API_STREAM_CONTENT_FD >= 0 )) && exec {API_STREAM_CONTENT_FD}>&- 2>/dev/null
+  API_STREAM_THINK_FD=-1
+  API_STREAM_CONTENT_FD=-1
+}
+
+_api_stream_read_fd() {
+  local fd="$1" chunk="" output=""
+  (( fd >= 0 )) || { REPLY=""; return 1; }
+  while sysread -i "$fd" -s 32768 -t 0 chunk 2>/dev/null; do
+    output+="$chunk"
+  done
+  REPLY="$output"
+  [[ -n "$output" ]]
+}
+
+# Read only bytes appended since the previous poll, instead of copying both
+# complete growing response files every 50ms.
+api_stream_read_updates() {
+  API_STREAM_THINKING_DELTA=""
+  API_STREAM_CONTENT_DELTA=""
+  _api_stream_read_fd "$API_STREAM_THINK_FD" && API_STREAM_THINKING_DELTA="$REPLY"
+  _api_stream_read_fd "$API_STREAM_CONTENT_FD" && API_STREAM_CONTENT_DELTA="$REPLY"
+  [[ -n "$API_STREAM_THINKING_DELTA$API_STREAM_CONTENT_DELTA" ]]
+}
+
+api_stream_collect() {
+  local pid="$1" base_file="$2"
+  local status_file="${base_file}.status" err_file="${base_file}.err"
+  API_STREAM_STATUS="${mapfile[$status_file]:-1}"
+  [[ "$API_STREAM_STATUS" == <0-255> ]] || API_STREAM_STATUS=1
+  API_STREAM_ERROR="${mapfile[$err_file]}"
+  [[ -n "$pid" ]] && wait "$pid" 2>/dev/null
+  API_STREAM_PID=""
+  (( API_STREAM_STATUS == 0 )) || {
+    [[ -n "$API_STREAM_ERROR" ]] || API_STREAM_ERROR="Ollama response worker failed"
+    return "$API_STREAM_STATUS"
+  }
 }
 
 api_stop_stream() {
   local pid="$1"
   if [[ -n "$pid" ]] && kill -0 "$pid" 2>/dev/null; then
     kill -TERM "$pid" 2>/dev/null
-    kill -KILL "$pid" 2>/dev/null
+    zselect -t 2 2>/dev/null
+    kill -0 "$pid" 2>/dev/null && kill -KILL "$pid" 2>/dev/null
+    wait "$pid" 2>/dev/null
   fi
+  API_STREAM_PID=""
+  api_stream_close_readers
 }
