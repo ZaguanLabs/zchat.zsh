@@ -1,4 +1,4 @@
-# ⚡ zchat.zsh v1.0.4 — Native ZSH & Curses AI Terminal Interface
+# ⚡ zchat.zsh v1.0.5 — Native ZSH & Curses AI Terminal Interface
 
 > A full-screen, split-pane Terminal User Interface (TUI) AI chat client written in **pure ZSH**, connecting directly to **Ollama's Chat API** through Zsh's native TCP module with live token streaming, collapsible reasoning, and rich Markdown rendering.
 
@@ -52,7 +52,7 @@ See [System Requirements & Prerequisites](#-system-requirements--prerequisites) 
 
 ```
 ┌───────────────────────────────────────────────────────────────────────────┐
-│ ⚡ zchat.zsh v1.0.4 │ Model: gemma4:12b (localhost:11434)     [ Ready ]   │
+│ ⚡ zchat.zsh v1.0.5 │ Model: gemma4:12b (localhost:11434)     [ Ready ]   │
 ├───────────────┬───────────────────────────────────────────────────────────┤
 │ Sessions (3)  │  Chat Transcript (4 msgs)                                 │
 │ ▶ Hello World │  🧑 You  11:00                                            │
@@ -145,7 +145,7 @@ brew install zsh
 
 ### 5. Model Switcher & System Prompts
 * **Model Picker (`Ctrl+O`)**: Queries your Ollama server's `/api/tags` endpoint and opens an interactive modal to browse and switch models live.
-* **Context-aware model loading**: In `auto` mode, zchat uses the active allocation reported by Ollama's `/api/ps`, falls back conservatively for unloaded models, then refreshes after the first response. The chosen `num_ctx` is pinned in chat requests.
+* **Context-aware model loading**: In `auto` mode, zchat uses the active allocation reported by Ollama's `/api/ps`. For an unloaded model, the 65,536-token fallback is used only for provisional accounting: the first request omits `num_ctx` so Ollama can apply the model or server default. After the response, zchat discovers and pins the authoritative allocation for later requests.
 * **System Prompt Presets (`Ctrl+S`)**: Quick-switch between personas:
   * *Default* (Helpful & Knowledgeable)
   * *Coding* (Expert Software Engineer)
@@ -233,7 +233,7 @@ Compaction follows the continuation-checkpoint design used by `zcoder.zsh`, adap
 4. The model context becomes that checkpoint plus a recent raw tail of the conversation. The full TUI transcript remains visible and saved.
 5. Checkpoints, the user-turn-aligned raw-tail boundary, token calibration, rearm threshold, and bounded non-duplicated exact-user ledger are persisted with each session, so resumed conversations keep their compacted context.
 
-Context sizing defaults to `auto`. If the selected model is loaded, zchat uses the allocation from Ollama's `/api/ps`; otherwise it starts with a 65,536-token fallback and refreshes after the first response. Use `--context-window TOKENS` or `ZCHAT_CONTEXT_WINDOW` to request a fixed allocation. Larger contexts consume more memory.
+Context sizing defaults to `auto`. If the selected model is loaded, zchat uses and pins the allocation from Ollama's `/api/ps`. If it is unloaded, zchat temporarily uses 65,536 tokens for its own estimates but omits `num_ctx` from the first request, allowing Ollama to choose the model or server default; it then refreshes and pins that active allocation after the response. Use `--context-window TOKENS` or `ZCHAT_CONTEXT_WINDOW` to request and pin a fixed allocation from the first request. Larger contexts consume more memory.
 
 Use `/compact` to checkpoint manually and `/context` to inspect the current budget. Repeated summaries can gradually lose precision, so a focused new chat is still preferable when an old thread is no longer useful.
 

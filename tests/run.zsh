@@ -39,6 +39,11 @@ assert_contains() {
   [[ "$value" == *"$expected"* ]] && pass "$label" || fail "$label"
 }
 
+assert_not_contains() {
+  local value="$1" unexpected="$2" label="$3"
+  [[ "$value" != *"$unexpected"* ]] && pass "$label" || fail "$label"
+}
+
 typeset -g ZCHAT_DEFAULT_OLLAMA_HOST="localhost:11434"
 typeset -g ZCHAT_HOST_OVERRIDE=0
 typeset -g ZCHAT_MODEL_OVERRIDE=0
@@ -179,13 +184,48 @@ SESSION_SYSTEM_PROMPT="Be useful."
 SESSION_TEMPERATURE=0.7
 typeset saved_context_lookup="${functions[api_get_running_context]}"
 api_get_running_context() {
-  API_RUNNING_CONTEXT=98304
-  return 0
+  if [[ "$1" == "qwen:latest" ]]; then
+    API_RUNNING_CONTEXT=98304
+    return 0
+  fi
+  return 1
 }
 ZCHAT_CONTEXT_WINDOW=auto
 CHAT_CONTEXT_MODEL=""
 chat_context_configure
 assert_eq "98304" "$CHAT_CONTEXT_WINDOW" "automatic sizing uses Ollama's loaded model allocation"
+assert_eq "0" "$CHAT_CONTEXT_DISCOVERY_PENDING" "loaded model context discovery is complete"
+chat_context_options_json
+assert_contains "$REPLY" '"num_ctx":98304' "loaded model requests pin the discovered allocation"
+
+SESSION_MODEL="unloaded:latest"
+CHAT_CONTEXT_MODEL=""
+chat_context_configure
+assert_eq "$ZCHAT_CONTEXT_FALLBACK" "$CHAT_CONTEXT_WINDOW" "unloaded models use the fallback for provisional accounting"
+assert_eq "1" "$CHAT_CONTEXT_DISCOVERY_PENDING" "unloaded model allocation remains pending"
+chat_context_options_json
+assert_eq "" "$REPLY" "pending automatic context does not request the fallback allocation"
+MSG_ROLES=(user)
+MSG_CONTENTS=("first request")
+MSG_THINKINGS=("")
+MSG_THINKING_EXPANDED=(0)
+MSG_TIMES=("")
+state_build_payload
+assert_not_contains "$REPLY" '"num_ctx"' "first unloaded-model payload lets Ollama choose its default context"
+chat_context_summary
+assert_contains "$REPLY" "provisional accounting fallback" "context status identifies the provisional fallback"
+
+api_get_running_context() {
+  API_RUNNING_CONTEXT=131072
+  return 0
+}
+chat_context_refresh_after_response
+assert_eq "131072" "$CHAT_CONTEXT_WINDOW" "post-response discovery adopts Ollama's active allocation"
+assert_eq "0" "$CHAT_CONTEXT_DISCOVERY_PENDING" "post-response discovery clears the pending state"
+chat_context_options_json
+assert_contains "$REPLY" '"num_ctx":131072' "later requests pin the authoritative active allocation"
+chat_context_summary
+assert_contains "$REPLY" "active Ollama allocation" "context status identifies an authoritative allocation"
 functions[api_get_running_context]="$saved_context_lookup"
 
 ZCHAT_CONTEXT_WINDOW=8192
@@ -201,6 +241,8 @@ state_build_payload
 assert_contains "$REPLY" '"num_ctx":8192' "chat requests pin the selected context allocation"
 assert_contains "$REPLY" "follow up" "chat payload includes real conversation messages"
 [[ "$REPLY" != *"UI-only notice"* ]] && pass "UI system notices stay out of model context" || fail "UI system notices stay out of model context"
+chat_context_summary
+assert_contains "$REPLY" "explicit setting" "context status identifies a fixed allocation"
 
 api_chat_sync() {
   API_HTTP_BODY='{"message":{"content":"Durable checkpoint"},"done":true,"prompt_eval_count":1800,"eval_count":120}'

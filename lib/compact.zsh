@@ -138,7 +138,14 @@ chat_estimate_payload_tokens() {
 }
 
 chat_context_options_json() {
-  # Pin the discovered or requested allocation so accounting and Ollama agree.
+  # When an auto-selected model is not loaded yet, let Ollama apply its
+  # Modelfile/server default. The fallback remains accounting-only until /api/ps
+  # reports the allocation after the first response.
+  if [[ "$ZCHAT_CONTEXT_WINDOW" == auto ]] && (( CHAT_CONTEXT_DISCOVERY_PENDING )); then
+    REPLY=""
+    return 0
+  fi
+  # Pin a discovered or explicitly requested allocation so accounting agrees.
   REPLY="\"num_ctx\":${CHAT_CONTEXT_WINDOW},"
 }
 
@@ -369,7 +376,7 @@ chat_record_response_usage() {
 }
 
 chat_context_summary() {
-  local last_prompt="unknown"
+  local last_prompt="unknown" context_status=""
   local -i estimate limit
   chat_context_configure
   state_build_payload
@@ -378,5 +385,12 @@ chat_context_summary() {
   chat_compaction_limit
   limit=$REPLY
   (( CHAT_LAST_PROMPT_TOKENS > 0 )) && last_prompt="$CHAT_LAST_PROMPT_TOKENS"
-  REPLY="Context: ${CHAT_CONTEXT_WINDOW} tokens (${ZCHAT_CONTEXT_WINDOW} setting); estimated next prompt: ${estimate} tokens; automatic compaction near ${limit} tokens (${ZCHAT_COMPACT_PERCENT}%); checkpoints: ${CHAT_COMPACTION_COUNT}; last Ollama prompt: ${last_prompt}."
+  if [[ "$ZCHAT_CONTEXT_WINDOW" == <4096-> ]]; then
+    context_status="explicit setting"
+  elif (( CHAT_CONTEXT_DISCOVERY_PENDING )); then
+    context_status="provisional accounting fallback; first request unpinned"
+  else
+    context_status="active Ollama allocation"
+  fi
+  REPLY="Context: ${CHAT_CONTEXT_WINDOW} tokens (${context_status}); estimated next prompt: ${estimate} tokens; automatic compaction near ${limit} tokens (${ZCHAT_COMPACT_PERCENT}%); checkpoints: ${CHAT_COMPACTION_COUNT}; last Ollama prompt: ${last_prompt}."
 }

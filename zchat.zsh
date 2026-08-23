@@ -11,7 +11,7 @@ zmodload zsh/curses zsh/datetime zsh/files zsh/mapfile zsh/net/tcp \
 }
 
 typeset -gr ZCHAT_NAME="zchat.zsh"
-typeset -gr ZCHAT_VERSION="1.0.4"
+typeset -gr ZCHAT_VERSION="1.0.5"
 typeset -gr ZCHAT_DEFAULT_OLLAMA_HOST="localhost:11434"
 typeset -g ZCHAT_HOST_OVERRIDE=0
 typeset -g ZCHAT_MODEL_OVERRIDE=0
