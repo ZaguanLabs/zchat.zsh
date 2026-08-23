@@ -244,7 +244,9 @@ assert_contains "$REPLY" "follow up" "chat payload includes real conversation me
 chat_context_summary
 assert_contains "$REPLY" "explicit setting" "context status identifies a fixed allocation"
 
+typeset -g MOCK_COMPACT_PAYLOAD=""
 api_chat_sync() {
+  MOCK_COMPACT_PAYLOAD="$1"
   API_HTTP_BODY='{"message":{"content":"Durable checkpoint"},"done":true,"prompt_eval_count":1800,"eval_count":120}'
   return 0
 }
@@ -360,6 +362,75 @@ CHAT_USER_MESSAGES=("${MSG_CONTENTS[1]}" "continue")
 chat_prepare_payload
 assert_eq "1" "$CHAT_COMPACTION_COUNT" "oversized prompts trigger automatic compaction"
 assert_contains "$REPLY" "Durable checkpoint" "automatic compaction rebuilds the pending prompt"
+
+functions[_test_real_compaction_builder]="${functions[chat_build_compaction_payload]}"
+typeset -gi MOCK_COMPACTION_BUILDS=0
+typeset -ga MOCK_COMPACTION_STARTS=()
+chat_build_compaction_payload() {
+  (( MOCK_COMPACTION_BUILDS++ ))
+  MOCK_COMPACTION_STARTS+=("${1:-$CHAT_CONTEXT_START_INDEX}")
+  _test_real_compaction_builder "$@"
+}
+ZCHAT_CONTEXT_WINDOW=4096
+CHAT_CONTEXT_WINDOW=4096
+CHAT_CONTEXT_MODEL="$SESSION_MODEL"
+CHAT_CONTEXT_HOST="$OLLAMA_HOST"
+CHAT_CONTEXT_START_INDEX=1
+CHAT_COMPACTION_SUMMARY=""
+CHAT_COMPACTION_COUNT=0
+CHAT_LAST_PROMPT_TOKENS=0
+CHAT_LAST_PAYLOAD_BYTES=0
+MSG_ROLES=()
+MSG_CONTENTS=()
+MSG_THINKINGS=()
+MSG_THINKING_EXPANDED=()
+MSG_TIMES=()
+CHAT_USER_MESSAGES=()
+for compact_exchange in {1..64}; do
+  MSG_ROLES+=(user assistant)
+  MSG_CONTENTS+=("request ${compact_exchange}: ${(l:240::u:)}" "answer ${compact_exchange}: ${(l:240::a:)}")
+  MSG_THINKINGS+=("" "")
+  MSG_THINKING_EXPANDED+=(0 0)
+  MSG_TIMES+=("" "")
+  CHAT_USER_MESSAGES+=("request ${compact_exchange}: ${(l:240::u:)}")
+done
+typeset -a compact_users_before=("${CHAT_USER_MESSAGES[@]}")
+chat_compact_history manual
+large_compact_status=$?
+assert_eq "0" "$large_compact_status" "large-history compaction completes"
+(( MOCK_COMPACTION_BUILDS <= 8 )) && pass "large-history compaction uses a logarithmic cutoff search" || fail "large-history compaction uses a logarithmic cutoff search"
+typeset -i aligned_search=1 compact_start
+for compact_start in "${MOCK_COMPACTION_STARTS[@]}"; do
+  [[ "${MSG_ROLES[compact_start]}" == user ]] || { aligned_search=0; break; }
+done
+(( aligned_search )) && pass "cutoff search evaluates only user-turn boundaries" || fail "cutoff search evaluates only user-turn boundaries"
+assert_not_contains "$MOCK_COMPACT_PAYLOAD" "answer 1:" "large-history cutoff omits old assistant detail"
+assert_contains "$MOCK_COMPACT_PAYLOAD" "answer 64:" "large-history cutoff retains the newest complete exchange"
+typeset -i selected_exchange=0 selected_estimate=0 previous_estimate=0
+for compact_exchange in {1..64}; do
+  if [[ "$MOCK_COMPACT_PAYLOAD" == *"answer ${compact_exchange}:"* ]]; then
+    selected_exchange=$compact_exchange
+    break
+  fi
+done
+(( selected_exchange > 1 )) && pass "large-history search selects a measurable interior cutoff" || fail "large-history search selects a measurable interior cutoff"
+typeset compact_summary_after="$CHAT_COMPACTION_SUMMARY"
+typeset -a compact_users_after=("${CHAT_USER_MESSAGES[@]}")
+CHAT_COMPACTION_SUMMARY=""
+CHAT_USER_MESSAGES=("${compact_users_before[@]}")
+_test_real_compaction_builder $(( selected_exchange * 2 - 1 ))
+[[ "$REPLY" == "$MOCK_COMPACT_PAYLOAD" ]] && pass "cutoff payload begins at the selected complete user turn" || fail "cutoff payload begins at the selected complete user turn"
+chat_estimate_payload_tokens "$REPLY"
+selected_estimate=$REPLY
+_test_real_compaction_builder $(( (selected_exchange - 1) * 2 - 1 ))
+chat_estimate_payload_tokens "$REPLY"
+previous_estimate=$REPLY
+(( selected_estimate <= CHAT_CONTEXT_WINDOW * 85 / 100 )) && pass "selected user-turn cutoff fits the checkpoint budget" || fail "selected user-turn cutoff fits the checkpoint budget"
+(( previous_estimate > CHAT_CONTEXT_WINDOW * 85 / 100 )) && pass "preceding user-turn cutoff still exceeds the checkpoint budget" || fail "preceding user-turn cutoff still exceeds the checkpoint budget"
+CHAT_COMPACTION_SUMMARY="$compact_summary_after"
+CHAT_USER_MESSAGES=("${compact_users_after[@]}")
+functions[chat_build_compaction_payload]="${functions[_test_real_compaction_builder]}"
+unfunction _test_real_compaction_builder
 
 source "${PROJECT_DIR}/lib/render.zsh"
 source "${PROJECT_DIR}/lib/ui.zsh"

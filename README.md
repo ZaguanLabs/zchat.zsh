@@ -1,4 +1,4 @@
-# ⚡ zchat.zsh v1.0.5 — Native ZSH & Curses AI Terminal Interface
+# ⚡ zchat.zsh v1.0.6 — Native ZSH & Curses AI Terminal Interface
 
 > A full-screen, split-pane Terminal User Interface (TUI) AI chat client written in **pure ZSH**, connecting directly to **Ollama's Chat API** through Zsh's native TCP module with live token streaming, collapsible reasoning, and rich Markdown rendering.
 
@@ -52,7 +52,7 @@ See [System Requirements & Prerequisites](#-system-requirements--prerequisites) 
 
 ```
 ┌───────────────────────────────────────────────────────────────────────────┐
-│ ⚡ zchat.zsh v1.0.5 │ Model: gemma4:12b (localhost:11434)     [ Ready ]   │
+│ ⚡ zchat.zsh v1.0.6 │ Model: gemma4:12b (localhost:11434)     [ Ready ]   │
 ├───────────────┬───────────────────────────────────────────────────────────┤
 │ Sessions (3)  │  Chat Transcript (4 msgs)                                 │
 │ ▶ Hello World │  🧑 You  11:00                                            │
@@ -229,9 +229,10 @@ Compaction follows the continuation-checkpoint design used by `zcoder.zsh`, adap
 
 1. Ollama's `prompt_eval_count` calibrates a conservative pre-request estimate. Before the first usage sample, zchat estimates three bytes per token plus fixed chat-template headroom.
 2. Automatic compaction starts at 85% of the allocated context by default. Change it with `--compact-at PERCENT` or `ZCHAT_COMPACT_PERCENT`.
-3. A non-streaming, non-thinking model turn creates a concise chat checkpoint, capped at the smaller of 2,048 tokens or 10% of the active context.
-4. The model context becomes that checkpoint plus a recent raw tail of the conversation. The full TUI transcript remains visible and saved.
-5. Checkpoints, the user-turn-aligned raw-tail boundary, token calibration, rearm threshold, and bounded non-duplicated exact-user ledger are persisted with each session, so resumed conversations keep their compacted context.
+3. A logarithmic cutoff search finds the earliest user-turn-aligned history that fits the checkpoint request, avoiding repeated full-history encoding on long conversations.
+4. A non-streaming, non-thinking model turn creates a concise chat checkpoint, capped at the smaller of 2,048 tokens or 10% of the active context.
+5. The model context becomes that checkpoint plus a recent raw tail of the conversation. The full TUI transcript remains visible and saved.
+6. Checkpoints, the user-turn-aligned raw-tail boundary, token calibration, rearm threshold, and bounded non-duplicated exact-user ledger are persisted with each session, so resumed conversations keep their compacted context.
 
 Context sizing defaults to `auto`. If the selected model is loaded, zchat uses and pins the allocation from Ollama's `/api/ps`. If it is unloaded, zchat temporarily uses 65,536 tokens for its own estimates but omits `num_ctx` from the first request, allowing Ollama to choose the model or server default; it then refreshes and pins that active allocation after the response. Use `--context-window TOKENS` or `ZCHAT_CONTEXT_WINDOW` to request and pin a fixed allocation from the first request. Larger contexts consume more memory.
 

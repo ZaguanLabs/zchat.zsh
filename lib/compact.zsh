@@ -249,9 +249,11 @@ chat_compaction_replace_history() {
 }
 
 chat_compact_history() {
-  local trigger="${1:-manual}" payload="" response="" summary="" dropped_note="" size_note=""
+  local trigger="${1:-manual}" payload="" best_payload="" response="" summary="" dropped_note="" size_note=""
   local -i start=$CHAT_CONTEXT_START_INDEX original_start=$CHAT_CONTEXT_START_INDEX
   local -i count=${#MSG_ROLES} hard_limit estimate request_status before after
+  local -i i low high midpoint candidate best_start
+  local -a candidate_starts=()
   CHAT_COMPACTION_ERROR=""
   CHAT_COMPACTION_CANCELLED=0
   (( count > 0 || ${#CHAT_COMPACTION_SUMMARY} > 0 )) || return 2
@@ -264,17 +266,45 @@ chat_compact_history() {
   before=$REPLY
   hard_limit=$(( CHAT_CONTEXT_WINDOW * 85 / 100 ))
 
-  while true; do
+  # A chat checkpoint must begin at a complete user turn. Search only those
+  # boundaries, preserving the earliest fitting tail while avoiding one full
+  # payload rebuild and JSON-escape pass per discarded exchange.
+  while (( start <= count )) && [[ "${MSG_ROLES[start]}" != user ]]; do
+    (( start++ ))
+  done
+  candidate_starts=("$start")
+  for (( i=start+1; i<=count; i++ )); do
+    [[ "${MSG_ROLES[i]}" == user ]] && candidate_starts+=("$i")
+  done
+  low=1
+  high=${#candidate_starts}
+  best_start="${candidate_starts[-1]}"
+  while (( low <= high )); do
+    midpoint=$(( (low + high) / 2 ))
+    candidate="${candidate_starts[midpoint]}"
+    chat_build_compaction_payload "$candidate"
+    payload="$REPLY"
+    chat_estimate_payload_tokens "$payload"
+    estimate=$REPLY
+    if (( estimate <= hard_limit )); then
+      best_start=$candidate
+      best_payload="$payload"
+      high=$(( midpoint - 1 ))
+    else
+      low=$(( midpoint + 1 ))
+    fi
+  done
+  start=$best_start
+  if [[ -n "$best_payload" ]]; then
+    payload="$best_payload"
+    chat_estimate_payload_tokens "$payload"
+    estimate=$REPLY
+  else
     chat_build_compaction_payload "$start"
     payload="$REPLY"
     chat_estimate_payload_tokens "$payload"
     estimate=$REPLY
-    (( estimate <= hard_limit || start >= count )) && break
-    (( start++ ))
-    while (( start < count )) && [[ "${MSG_ROLES[start]}" != user ]]; do
-      (( start++ ))
-    done
-  done
+  fi
 
   if (( $+functions[ui_wait_for_compaction] )); then
     api_async_start POST /api/chat "$payload" "$OLLAMA_HOST" || {
