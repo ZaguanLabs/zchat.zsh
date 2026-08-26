@@ -246,6 +246,7 @@ chat_compaction_replace_history() {
   CHAT_COMPACTION_SUMMARY="$summary"
   CHAT_CONTEXT_START_INDEX="$start"
   CHAT_USER_MESSAGES=("${kept_users[@]}")
+  (( $+functions[_state_mark_users_dirty] )) && _state_mark_users_dirty 1
 }
 
 chat_compact_history() {

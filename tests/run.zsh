@@ -318,6 +318,38 @@ state_save_session
 state_load_session "compaction-test"
 assert_eq "model-used-for-reply" "${MSG_MODELS[-1]}" "assistant messages retain their generating model"
 
+# Incremental persistence: unchanged message files are not rewritten, changed
+# ones are, and a lost session directory is fully recreated on the next save.
+CURRENT_SESSION_ID="incremental-test"
+STATE_SAVED_SESSION_ID=""
+SESSION_TITLE="Incremental"
+MSG_ROLES=(user assistant user)
+MSG_CONTENTS=("one" "two" "three")
+MSG_THINKINGS=("" "some thinking" "")
+MSG_THINKING_EXPANDED=(0 1 0)
+MSG_TIMES=("" "" "")
+MSG_MODELS=("" "m" "")
+CHAT_USER_MESSAGES=("one" "three")
+state_save_session
+typeset incr_dir="${ZCHAT_SESSIONS_DIR}/incremental-test.session"
+assert_eq "3" "${mapfile[$incr_dir/message_count]}" "incremental baseline saves every message"
+mapfile[$incr_dir/messages/000001.content]="tampered"
+state_append_message system "a fourth message"
+assert_eq "tampered" "${mapfile[$incr_dir/messages/000001.content]}" "append leaves already-persisted messages untouched"
+assert_eq "a fourth message" "${mapfile[$incr_dir/messages/000004.content]}" "append persists the new message"
+assert_eq "4" "${mapfile[$incr_dir/message_count]}" "append advances the commit marker"
+state_toggle_last_reasoning
+assert_eq "0" "${mapfile[$incr_dir/messages/000002.expanded]}" "mid-transcript changes persist their own file"
+assert_eq "tampered" "${mapfile[$incr_dir/messages/000001.content]}" "mid-transcript changes do not rewrite earlier files"
+zf_rm -rf -- "$incr_dir"
+state_save_session
+assert_eq "one" "${mapfile[$incr_dir/messages/000001.content]}" "a recreated session directory is fully rewritten"
+assert_eq "4" "${mapfile[$incr_dir/message_count]}" "recreated session restores the commit marker"
+state_load_session "incremental-test"
+assert_eq "4" "${#MSG_ROLES}" "recreated session reloads the complete transcript"
+assert_eq "a fourth message" "${MSG_CONTENTS[4]}" "recreated session reloads message content"
+state_load_session "compaction-test"
+
 _state_write_config
 typeset -A file_stat=() dir_stat=()
 zstat -H file_stat "$ZCHAT_CONFIG_FILE"

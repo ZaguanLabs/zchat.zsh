@@ -32,33 +32,35 @@ typeset -ga JSON_SESSION_TIMES=()
 # Encode a string as a JSON string literal. Result is returned in REPLY.
 json_quote() {
   local input="$1"
-  local output='"'
-  local ch="" escaped=""
-  local -i i code
 
-  for (( i=1; i<=${#input}; i++ )); do
-    ch="${input[i]}"
-    case "$ch" in
-      '"') output+='\"' ;;
-      $'\\') output+='\\' ;;
-      $'\b') output+='\b' ;;
-      $'\f') output+='\f' ;;
-      $'\n') output+='\n' ;;
-      $'\r') output+='\r' ;;
-      $'\t') output+='\t' ;;
-      *)
-        printf -v code '%d' "'$ch"
-        if (( code < 32 )); then
-          printf -v escaped '\\u%04x' "$code"
-          output+="$escaped"
-        else
-          output+="$ch"
-        fi
-        ;;
-    esac
-  done
+  # Most strings contain nothing that needs escaping.
+  if [[ "$input" != *[$'\x00'-$'\x1f'\"\\\\]* ]]; then
+    REPLY="\"${input}\""
+    return 0
+  fi
 
-  REPLY="${output}\""
+  # Batched C-level substitutions; the backslash must be escaped first.
+  local output="${input//$'\\'/\\\\}"
+  output="${output//\"/\\\"}"
+  output="${output//$'\b'/\\b}"
+  output="${output//$'\f'/\\f}"
+  output="${output//$'\n'/\\n}"
+  output="${output//$'\r'/\\r}"
+  output="${output//$'\t'/\\t}"
+
+  # Remaining control characters are rare; substitute only those present.
+  if [[ "$output" == *[$'\x00'-$'\x07'$'\x0b'$'\x0e'-$'\x1f']* ]]; then
+    local ch="" escaped=""
+    local -i code
+    for code in {1..7} 11 {14..31}; do
+      printf -v escaped '\\u%04x' "$code"
+      printf -v ch '%b' "$escaped"
+      [[ "$output" == *"$ch"* ]] && output="${output//$ch/$escaped}"
+    done
+    output="${output//$'\0'/\\u0000}"
+  fi
+
+  REPLY="\"${output}\""
 }
 
 json_begin() {
@@ -75,13 +77,10 @@ json_begin() {
 json_next() {
   local ch="" esc="" hex="" low_hex="" encoded="" decoded=""
   local value=""
-  local -i cp low_cp
+  local -i cp low_cp stop
 
-  while (( JSON_POS <= JSON_LEN )); do
-    ch="${JSON_SOURCE[JSON_POS]}"
-    [[ "$ch" == [[:space:]] ]] || break
-    (( JSON_POS++ ))
-  done
+  # Jump to the next non-whitespace character at C speed.
+  (( JSON_POS <= JSON_LEN )) && JSON_POS=${JSON_SOURCE[(ib:JSON_POS:)[^[:space:]]]}
 
   if (( JSON_POS > JSON_LEN )); then
     JSON_TOKEN_TYPE="eof"
@@ -101,16 +100,16 @@ json_next() {
       (( JSON_POS++ ))
       value=""
       while (( JSON_POS <= JSON_LEN )); do
-        ch="${JSON_SOURCE[JSON_POS]}"
-        (( JSON_POS++ ))
+        # Find the next quote or escape without visiting every character.
+        stop=${JSON_SOURCE[(ib:JSON_POS:)[\"\\\\]]}
+        (( stop > JSON_LEN )) && break
+        (( stop > JSON_POS )) && value+="${JSON_SOURCE[JSON_POS,stop-1]}"
+        ch="${JSON_SOURCE[stop]}"
+        JSON_POS=$(( stop + 1 ))
         if [[ "$ch" == '"' ]]; then
           JSON_TOKEN_TYPE="string"
           JSON_TOKEN_VALUE="$value"
           return 0
-        fi
-        if [[ "$ch" != $'\\' ]]; then
-          value+="$ch"
-          continue
         fi
 
         if (( JSON_POS > JSON_LEN )); then
@@ -166,25 +165,17 @@ json_next() {
       return 1
       ;;
     -|[0-9])
-      value=""
-      while (( JSON_POS <= JSON_LEN )); do
-        ch="${JSON_SOURCE[JSON_POS]}"
-        [[ "$ch" == [0-9eE+.-] ]] || break
-        value+="$ch"
-        (( JSON_POS++ ))
-      done
+      stop=${JSON_SOURCE[(ib:JSON_POS:)[^0-9eE+.-]]}
+      value="${JSON_SOURCE[JSON_POS,stop-1]}"
+      JSON_POS=$stop
       JSON_TOKEN_TYPE="number"
       JSON_TOKEN_VALUE="$value"
       return 0
       ;;
     [tfn])
-      value=""
-      while (( JSON_POS <= JSON_LEN )); do
-        ch="${JSON_SOURCE[JSON_POS]}"
-        [[ "$ch" == [[:alpha:]] ]] || break
-        value+="$ch"
-        (( JSON_POS++ ))
-      done
+      stop=${JSON_SOURCE[(ib:JSON_POS:)[^[:alpha:]]]}
+      value="${JSON_SOURCE[JSON_POS,stop-1]}"
+      JSON_POS=$stop
       case "$value" in
         true|false|null)
           JSON_TOKEN_TYPE="$value"

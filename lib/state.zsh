@@ -22,11 +22,29 @@ typeset -ga MSG_MODELS=()
 # Available sessions cache
 typeset -ga SESSION_IDS=()
 typeset -ga SESSION_TITLES=()
-typeset -ga SESSION_MODELS=()
+
+# Incremental-save bookkeeping. Message and ledger files at or after the dirty
+# index are rewritten on save; earlier files are already on disk unchanged. The
+# on-disk message_count/context_user_count files remain the commit markers, and
+# saves never trust the bookkeeping past what those markers cover.
+typeset -g STATE_SAVED_SESSION_ID=""
+typeset -gi STATE_MSG_DIRTY_FROM=1
+typeset -gi STATE_USERS_DIRTY_FROM=1
+
+_state_mark_message_dirty() {
+  (( $1 < STATE_MSG_DIRTY_FROM )) && STATE_MSG_DIRTY_FROM=$(( $1 < 1 ? 1 : $1 ))
+  return 0
+}
+
+_state_mark_users_dirty() {
+  (( $1 < STATE_USERS_DIRTY_FROM )) && STATE_USERS_DIRTY_FROM=$(( $1 < 1 ? 1 : $1 ))
+  return 0
+}
 
 # Initialize configuration directories and load initial session
 state_init() {
-  local old_umask="$(umask)"
+  zchat_umask
+  local old_umask="$REPLY"
   umask 077
   zf_mkdir -p "$ZCHAT_SESSIONS_DIR" 2>/dev/null || {
     umask "$old_umask"
@@ -69,7 +87,8 @@ state_init() {
 }
 
 _state_write_config() {
-  local host_json model_json system_json output tmp old_umask="$(umask)"
+  zchat_umask
+  local host_json model_json system_json output tmp old_umask="$REPLY"
   json_quote "$OLLAMA_HOST"; host_json="$REPLY"
   json_quote "$SESSION_MODEL"; model_json="$REPLY"
   json_quote "$SESSION_SYSTEM_PROMPT"; system_json="$REPLY"
@@ -126,19 +145,16 @@ state_migrate_legacy_sessions() {
 state_refresh_sessions_list() {
   SESSION_IDS=()
   SESSION_TITLES=()
-  SESSION_MODELS=()
 
-  local s_file s_id s_title s_model
+  local s_file s_id s_title
   # Session IDs begin with their creation timestamp. Sort filenames in reverse
   # order so the newest chat is always shown first in the sidebar.
   for s_file in "${ZCHAT_SESSIONS_DIR}"/*.session(N/On); do
     s_id="${s_file:t:r}"
     s_title="${mapfile[$s_file/title]:-Untitled}"
-    s_model="${mapfile[$s_file/model]:-unknown}"
 
     SESSION_IDS+=("$s_id")
     SESSION_TITLES+=("${s_title[1,20]}")
-    SESSION_MODELS+=("$s_model")
   done
 }
 
@@ -148,6 +164,8 @@ state_new_session() {
   local sys="${2:-$SESSION_SYSTEM_PROMPT}"
 
   CURRENT_SESSION_ID="${EPOCHSECONDS}_$RANDOM"
+  _state_mark_message_dirty 1
+  _state_mark_users_dirty 1
   SESSION_TITLE="New Chat"
   SESSION_MODEL="$model"
   SESSION_SYSTEM_PROMPT="$sys"
@@ -174,11 +192,23 @@ state_save_session() {
   local session_dir="${ZCHAT_SESSIONS_DIR}/${CURRENT_SESSION_ID}.session"
   local messages_dir="${session_dir}/messages"
   local users_dir="${session_dir}/context_users"
-  local seq prefix message_model old_umask="$(umask)"
+  zchat_umask
+  local seq prefix message_model old_umask="$REPLY"
   local -i i count=${#MSG_ROLES} old_message_count=${mapfile[$session_dir/message_count]:-0}
-  local -i old_user_count=${mapfile[$session_dir/context_user_count]:-0}
+  local -i old_user_count=${mapfile[$session_dir/context_user_count]:-0} msg_from users_from
   [[ "$old_message_count" == <0-> ]] || old_message_count=0
   [[ "$old_user_count" == <0-> ]] || old_user_count=0
+
+  # Rewrite only files the in-memory state has changed since the last save of
+  # this session, but never skip past what the on-disk commit markers cover.
+  if [[ "$STATE_SAVED_SESSION_ID" != "$CURRENT_SESSION_ID" ]]; then
+    STATE_MSG_DIRTY_FROM=1
+    STATE_USERS_DIRTY_FROM=1
+  fi
+  msg_from=$STATE_MSG_DIRTY_FROM
+  users_from=$STATE_USERS_DIRTY_FROM
+  (( msg_from > old_message_count + 1 )) && msg_from=$(( old_message_count + 1 ))
+  (( users_from > old_user_count + 1 )) && users_from=$(( old_user_count + 1 ))
   umask 077
   zf_mkdir -p "$messages_dir" "$users_dir" 2>/dev/null || {
     umask "$old_umask"
@@ -204,7 +234,7 @@ state_save_session() {
   mapfile[$session_dir/compaction_rearm_model]="$CHAT_COMPACTION_REARM_MODEL"
   mapfile[$session_dir/compaction_rearm_host]="$CHAT_COMPACTION_REARM_HOST"
 
-  for (( i=1; i<=count; i++ )); do
+  for (( i=msg_from; i<=count; i++ )); do
     printf -v seq '%06d' "$i"
     prefix="$messages_dir/$seq"
     mapfile[$prefix.role]="${MSG_ROLES[i]:-user}"
@@ -217,7 +247,7 @@ state_save_session() {
     mapfile[$prefix.model]="$message_model"
   done
 
-  for (( i=1; i<=${#CHAT_USER_MESSAGES}; i++ )); do
+  for (( i=users_from; i<=${#CHAT_USER_MESSAGES}; i++ )); do
     printf -v seq '%06d' "$i"
     mapfile[$users_dir/$seq]="${CHAT_USER_MESSAGES[i]}"
   done
@@ -235,6 +265,9 @@ state_save_session() {
     zf_rm -f -- "$users_dir/$seq" 2>/dev/null
   done
   umask "$old_umask"
+  STATE_SAVED_SESSION_ID="$CURRENT_SESSION_ID"
+  STATE_MSG_DIRTY_FROM=$(( count + 1 ))
+  STATE_USERS_DIRTY_FROM=$(( ${#CHAT_USER_MESSAGES} + 1 ))
 }
 
 # Load a session by ID
@@ -304,12 +337,19 @@ state_load_session() {
       [[ "${MSG_ROLES[i]}" == user ]] && CHAT_USER_MESSAGES+=("${MSG_CONTENTS[i]}")
     done
   fi
+  # Loaded state mirrors the on-disk files exactly; a later save only needs to
+  # write what changes after this point (the commit-marker clamp still guards
+  # the derived-ledger fallback above, which has no persisted user files yet).
+  STATE_SAVED_SESSION_ID="$id"
+  STATE_MSG_DIRTY_FROM=$(( len + 1 ))
+  STATE_USERS_DIRTY_FROM=$(( ${#CHAT_USER_MESSAGES} + 1 ))
   (( $+functions[render_invalidate] )) && render_invalidate
 }
 
 # Delete a session
 state_delete_session() {
   local id="$1"
+  [[ "$id" == "$STATE_SAVED_SESSION_ID" ]] && STATE_SAVED_SESSION_ID=""
   zf_rm -rf "${ZCHAT_SESSIONS_DIR}/${id}.session" 2>/dev/null
   zf_rm -f "${ZCHAT_SESSIONS_DIR}/${id}.json" 2>/dev/null
   state_refresh_sessions_list
@@ -343,17 +383,25 @@ state_append_message() {
   MSG_TIMES+=("$time_str")
   [[ "$role" == assistant && -z "$message_model" ]] && message_model="$SESSION_MODEL"
   MSG_MODELS+=("$message_model")
-  [[ "$role" == user ]] && CHAT_USER_MESSAGES+=("$content")
+  _state_mark_message_dirty ${#MSG_ROLES}
+  if [[ "$role" == user ]]; then
+    CHAT_USER_MESSAGES+=("$content")
+    _state_mark_users_dirty ${#CHAT_USER_MESSAGES}
+  fi
 
   # Auto-generate title from first user message if still "New Chat"
+  local -i title_changed=0
   if [[ "$role" == "user" && "$SESSION_TITLE" == "New Chat" ]]; then
     local clean_title="${content[1,22]}"
     clean_title="${clean_title//$'\n'/ }"
     SESSION_TITLE="$clean_title"
+    title_changed=1
   fi
 
   state_save_session
-  state_refresh_sessions_list
+  # The sidebar cache only shows session ids and titles, so an ordinary append
+  # does not need to rescan every session directory.
+  (( title_changed )) && state_refresh_sessions_list
   (( $+functions[render_invalidate] )) && render_invalidate
 }
 
@@ -367,6 +415,7 @@ state_begin_streaming_message() {
   zchat_time
   MSG_TIMES+=("$REPLY")
   MSG_MODELS+=("$SESSION_MODEL")
+  _state_mark_message_dirty ${#MSG_ROLES}
 }
 
 state_discard_streaming_message() {
@@ -379,6 +428,7 @@ state_discard_streaming_message() {
   MSG_THINKING_EXPANDED[-1]=()
   MSG_TIMES[-1]=()
   MSG_MODELS[-1]=()
+  _state_mark_message_dirty $count
   (( $+functions[render_invalidate] )) && render_invalidate
 }
 
@@ -394,6 +444,7 @@ state_update_streaming_message() {
     MSG_CONTENTS[count]="$content"
     MSG_THINKINGS[count]="$thinking"
     [[ -z "$previous_content" && -n "$content" && -n "$thinking" ]] && MSG_THINKING_EXPANDED[count]=0
+    _state_mark_message_dirty $count
   else
     MSG_ROLES+=("assistant")
     MSG_CONTENTS+=("$content")
@@ -402,6 +453,7 @@ state_update_streaming_message() {
     zchat_time
     MSG_TIMES+=("$REPLY")
     MSG_MODELS+=("$SESSION_MODEL")
+    _state_mark_message_dirty ${#MSG_ROLES}
   fi
 }
 
@@ -414,6 +466,7 @@ state_set_last_assistant_message() {
   if (( count > 0 )) && [[ "${MSG_ROLES[count]}" == "assistant" ]]; then
     MSG_CONTENTS[count]="$content"
     MSG_THINKINGS[count]="$thinking"
+    _state_mark_message_dirty $count
   else
     MSG_ROLES+=("assistant")
     MSG_CONTENTS+=("$content")
@@ -422,6 +475,7 @@ state_set_last_assistant_message() {
     zchat_time
     MSG_TIMES+=("$REPLY")
     MSG_MODELS+=("$SESSION_MODEL")
+    _state_mark_message_dirty ${#MSG_ROLES}
   fi
 
   state_save_session
@@ -440,6 +494,7 @@ state_toggle_last_reasoning() {
       else
         MSG_THINKING_EXPANDED[i]=1
       fi
+      _state_mark_message_dirty $i
       (( in_memory_only )) || state_save_session
       (( $+functions[render_invalidate] )) && render_invalidate
       return 0

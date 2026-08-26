@@ -29,8 +29,21 @@ _render_tokenize_inline() {
   local def_attr="${2:-white/black}"
   local -a spans=()
   local rem="$line" m=""
+  local -i cut
 
   while [[ -n "$rem" ]]; do
+    # Consume the plain-text run up to the next inline marker at C speed. The
+    # marker patterns below are start-anchored, so they can only match here.
+    cut=${rem[(ib:1:)[\\\\\`\*\[~]]}
+    if (( cut > 1 )); then
+      if (( cut > ${#rem} )); then
+        spans+=("${def_attr}${FIELD_SEP}${rem}")
+        break
+      fi
+      spans+=("${def_attr}${FIELD_SEP}${rem[1,cut-1]}")
+      rem="${rem[cut,-1]}"
+    fi
+
     # Inline code: `code`
     if [[ "$rem" =~ "^(\`[^\`]+\`)(.*)" ]]; then
       m="${match[1]}"
@@ -70,15 +83,10 @@ _render_tokenize_inline() {
         spans+=("dim white/black${FIELD_SEP} (${match[2]})")
       fi
 
-    # Plain text chunk
+    # A marker character that opens no inline construct is literal text.
     else
-      if [[ "$rem" =~ "^([^\\\`\*\[~]+)(.*)" ]]; then
-        spans+=("${def_attr}${FIELD_SEP}${match[1]}")
-        rem="${match[2]}"
-      else
-        spans+=("${def_attr}${FIELD_SEP}${rem[1,1]}")
-        rem="${rem[2,-1]}"
-      fi
+      spans+=("${def_attr}${FIELD_SEP}${rem[1,1]}")
+      rem="${rem[2,-1]}"
     fi
   done
 
@@ -95,7 +103,7 @@ _add_line() {
   RENDERED_LINES+=("$line_text")
   RENDERED_ATTRS+=("$line_attr")
 
-  if (( inline_fmt )) && [[ "$line_text" =~ '[\`\*\[~]' ]]; then
+  if (( inline_fmt )) && [[ "$line_text" == *[\`\*\[~]* ]]; then
     _render_tokenize_inline "$line_text" "$line_attr"
     span_str="$REPLY"
     RENDERED_SPANS+=("$span_str")

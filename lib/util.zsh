@@ -59,6 +59,15 @@ zchat_wrap() {
   ZCHAT_WRAPPED+=("$rest")
 }
 
+# Query the caller's umask once per process. Every zchat writer restores the
+# umask it sets, so the cached value stays valid and later writers avoid one
+# $(umask) subshell fork per save. Result is returned in REPLY.
+typeset -g ZCHAT_UMASK=""
+zchat_umask() {
+  [[ -n "$ZCHAT_UMASK" ]] || ZCHAT_UMASK="$(umask)"
+  REPLY="$ZCHAT_UMASK"
+}
+
 # Read an entire file through zsh/mapfile. Result is returned in REPLY.
 zchat_read_file() {
   REPLY="${mapfile[$1]}"

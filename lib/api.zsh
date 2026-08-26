@@ -25,7 +25,8 @@ typeset -ga API_MODELS=()
 # atomically-created directory avoids predictable /tmp files and symlink races.
 api_runtime_init() {
   [[ -n "$API_RUNTIME_DIR" && -d "$API_RUNTIME_DIR" ]] && return 0
-  local old_umask="$(umask)" candidate="" root="${${TMPDIR:-/tmp}:A}"
+  zchat_umask
+  local old_umask="$REPLY" candidate="" root="${${TMPDIR:-/tmp}:A}"
   local -i attempt
   umask 077
   for (( attempt=1; attempt<=20; attempt++ )); do
