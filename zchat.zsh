@@ -4,14 +4,9 @@
 # ==============================================================================
 
 setopt EXTENDED_GLOB NO_NOMATCH NO_MONITOR NO_NOTIFY NO_CHECK_JOBS NO_HUP 2>/dev/null
-zmodload zsh/curses zsh/datetime zsh/files zsh/mapfile zsh/net/tcp \
-  zsh/system zsh/terminfo zsh/zselect || {
-  echo "Error: required Zsh loadable modules are unavailable." >&2
-  exit 1
-}
 
 typeset -gr ZCHAT_NAME="zchat.zsh"
-typeset -gr ZCHAT_VERSION="1.0.6"
+typeset -gr ZCHAT_VERSION="1.0.7"
 typeset -gr ZCHAT_DEFAULT_OLLAMA_HOST="localhost:11434"
 typeset -g ZCHAT_HOST_OVERRIDE=0
 typeset -g ZCHAT_MODEL_OVERRIDE=0
@@ -23,22 +18,43 @@ typeset -g ZCHAT_REQUESTED_MODEL=""
 0="${${(M)0:#/*}:-$PWD/$0}"
 ZCHAT_DIR="${0:A:h}"
 
-# Source internal modules
-source "${ZCHAT_DIR}/lib/util.zsh"
-source "${ZCHAT_DIR}/lib/json.zsh"
-source "${ZCHAT_DIR}/lib/api.zsh"
-source "${ZCHAT_DIR}/lib/state.zsh"
-source "${ZCHAT_DIR}/lib/compact.zsh"
-source "${ZCHAT_DIR}/lib/render.zsh"
-source "${ZCHAT_DIR}/lib/input.zsh"
-source "${ZCHAT_DIR}/lib/modal.zsh"
-source "${ZCHAT_DIR}/lib/ui.zsh"
+# Load each library once, on demand. The modal library stays unloaded until an
+# overlay is opened, while fast CLI exits avoid loading the full TUI runtime.
+# `source` automatically uses a current sibling .zwc created by `make compile`.
+typeset -gA ZCHAT_LOADED_LIBS=()
+zchat_require() {
+  local lib=""
+  for lib in "$@"; do
+    (( ${+ZCHAT_LOADED_LIBS[$lib]} )) && continue
+    ZCHAT_LOADED_LIBS[$lib]=1
+    source "${ZCHAT_DIR}/lib/${lib}.zsh" || {
+      unset "ZCHAT_LOADED_LIBS[$lib]"
+      return 1
+    }
+  done
+}
+
+zchat_select_model() {
+  zchat_require modal || return 1
+  modal_select_model
+}
+
+zchat_select_system_prompt() {
+  zchat_require modal || return 1
+  modal_system_prompt
+}
+
+zchat_show_help() {
+  zchat_require modal || return 1
+  modal_show_help
+}
 
 # CLI Argument parsing
 while (( $# > 0 )); do
   case "$1" in
     --host|-h)
       shift
+      zchat_require api || exit 1
       if ! api_normalize_host "$1"; then
         echo "Error: $API_HOST_ERROR" >&2
         exit 2
@@ -88,6 +104,16 @@ while (( $# > 0 )); do
   esac
   shift
 done
+
+zmodload zsh/curses zsh/datetime zsh/files zsh/mapfile zsh/net/tcp \
+  zsh/system zsh/terminfo zsh/zselect || {
+  echo "Error: required Zsh loadable modules are unavailable." >&2
+  exit 1
+}
+
+# Compaction owns state persisted by state.zsh, so it is part of the core load
+# rather than a late feature module. Modals are the only mode-gated library.
+zchat_require util json api compact state render input ui || exit 1
 
 # Runtime state
 typeset -g RUNNING=1
@@ -324,7 +350,7 @@ main() {
         UI_STATUS_TEXT="Wait for response"
         ui_draw_header
       else
-        modal_select_model
+        zchat_select_model
         ui_setup_windows
         ui_refresh_all 0
       fi
@@ -335,14 +361,14 @@ main() {
         UI_STATUS_TEXT="Wait for response"
         ui_draw_header
       else
-        modal_system_prompt
+        zchat_select_system_prompt
         ui_setup_windows
         ui_refresh_all 0
       fi
 
     # Ctrl+H (^H = \x08 / \x7f with mod) or F1: Help modal
     elif [[ "$cur_ch" == $'\x08' || "$cur_key" == "F1" ]]; then
-      modal_show_help
+      zchat_show_help
       ui_setup_windows
       ui_refresh_all 0
 
@@ -435,7 +461,7 @@ main() {
           # Check for slash commands
           case "$prompt_text" in
             /model)
-              modal_select_model
+              zchat_select_model
               ui_setup_windows
               ui_refresh_all 0
               ;;
@@ -470,7 +496,7 @@ main() {
               ui_draw_chat 0
               ;;
             /sys*|/system*)
-              modal_system_prompt
+              zchat_select_system_prompt
               ui_setup_windows
               ui_refresh_all 0
               ;;
@@ -507,7 +533,7 @@ main() {
               ui_refresh_all 0
               ;;
             /help|/\?)
-              modal_show_help
+              zchat_show_help
               ui_setup_windows
               ui_refresh_all 0
               ;;

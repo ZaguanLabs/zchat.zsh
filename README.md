@@ -1,4 +1,4 @@
-# ⚡ zchat.zsh v1.0.6 — Native ZSH & Curses AI Terminal Interface
+# ⚡ zchat.zsh v1.0.7 — Native ZSH & Curses AI Terminal Interface
 
 > A full-screen, split-pane Terminal User Interface (TUI) AI chat client written in **pure ZSH**, connecting directly to **Ollama's Chat API** through Zsh's native TCP module with live token streaming, collapsible reasoning, and rich Markdown rendering.
 
@@ -52,7 +52,7 @@ See [System Requirements & Prerequisites](#-system-requirements--prerequisites) 
 
 ```
 ┌───────────────────────────────────────────────────────────────────────────┐
-│ ⚡ zchat.zsh v1.0.6 │ Model: gemma4:12b (localhost:11434)     [ Ready ]   │
+│ ⚡ zchat.zsh v1.0.7 │ Model: gemma4:12b (localhost:11434)     [ Ready ]   │
 ├───────────────┬───────────────────────────────────────────────────────────┤
 │ Sessions (3)  │  Chat Transcript (4 msgs)                                 │
 │ ▶ Hello World │  🧑 You  11:00                                            │
@@ -204,6 +204,7 @@ You can type these directly into the prompt box and hit `Enter`:
 chat.sh/
 ├── zchat.zsh           # Main application entry point & curses event loop
 ├── chat.sh             # Portable launcher script
+├── Makefile            # Syntax checks, tests & optional wordcode compilation
 ├── README.md           # Documentation & user guide
 └── lib/
     ├── api.zsh         # Native TCP/HTTP Ollama client & stream splitter
@@ -216,6 +217,18 @@ chat.sh/
     ├── modal.zsh       # Overlay modals for models, system prompts & help
     └── ui.zsh          # Multi-window curses layout, geometry & rendering
 ```
+
+### Library Loading & Optional Compilation
+
+`zchat_require` sources every library at most once. The core chat, state, and
+rendering libraries load for the full-screen client, while `modal.zsh` loads
+only when a model picker, system-prompt picker, or help overlay is opened.
+Fast `--help` and `--version` exits do not load the TUI runtime.
+
+Run `make compile` to precompile the libraries to Zsh `.zwc` wordcode. Zsh
+automatically uses a compiled file when it is current and ignores it when the
+matching `.zsh` source is newer, so compilation is optional and never required
+for correctness. Run `make clean` to remove generated wordcode.
 
 ### Event Loop Flow
 1. **Input Polling**: `zcurses input` polls non-blocking with a 50ms timeout. Native event decoding recognizes Shift/Alt+Enter and bracketed paste.

@@ -1,2 +1,4 @@
 # Atlas Scout local data
 .atlas/
+# Precompiled Zsh wordcode from `make compile`
+*.zwc
