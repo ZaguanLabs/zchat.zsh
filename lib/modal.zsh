@@ -12,15 +12,24 @@ _modal_frame() {
 
   zcurses move "$win" 0 2
   zcurses attr "$win" bold white/black
-  zcurses string "$win" " ${title} "
+  zchat_curses_string "$win" " ${title} "
   zcurses attr "$win" default/default
 }
 
 # Modal 1: Select Ollama Model
 modal_select_model() {
   local -a models=()
-  if api_get_models; then
-    models=("${API_MODELS[@]}")
+  local -i request_status=1
+  if api_async_start GET /api/tags "" "$OLLAMA_HOST"; then
+    ui_wait_for_async_request "Loading models"
+    request_status=$?
+    if (( request_status == 130 )); then
+      api_async_cancel
+      return 130
+    fi
+    if api_async_collect && json_parse_models "$API_HTTP_BODY"; then
+      models=("${JSON_MODEL_NAMES[@]}")
+    fi
   fi
 
   local total=${#models}
@@ -74,13 +83,13 @@ modal_select_model() {
         zcurses attr modal_win reverse bold cyan/black
         zchat_pad_right "$display_str" $(( m_w - 4 ))
         padded="$REPLY"
-        zcurses string modal_win "$padded"
+        zchat_curses_string modal_win "$padded"
         zcurses attr modal_win -reverse default/default
       else
         zcurses attr modal_win white/black
         zchat_pad_right "$display_str" $(( m_w - 4 ))
         padded="$REPLY"
-        zcurses string modal_win "$padded"
+        zchat_curses_string modal_win "$padded"
       fi
       (( row++ ))
     done
@@ -88,7 +97,7 @@ modal_select_model() {
     # Status count at bottom
     zcurses move modal_win $(( m_h - 2 )) 2
     zcurses attr modal_win dim white/black
-    zcurses string modal_win "Model ${sel}/${total}  [Host: ${OLLAMA_HOST}]"
+    zchat_curses_string modal_win "Model ${sel}/${total}  [Host: ${OLLAMA_HOST}]"
 
     zcurses refresh modal_win
 
@@ -113,7 +122,7 @@ modal_select_model() {
       (( sel > total )) && sel=$total
     elif [[ "$cur_ch" == $'\n' || "$cur_ch" == $'\r' || "$cur_key" == "ENTER" || "$cur_key" == "PADENTER" ]]; then
       SESSION_MODEL="${models[sel]}"
-      state_save_session
+      state_save_session || UI_STATUS_TEXT="Save error"
       break
     elif [[ "$cur_ch" == $'\x1b' || "$cur_ch" == "q" || "$cur_ch" == $'\x03' ]]; then
       break
@@ -159,11 +168,11 @@ modal_system_prompt() {
       padded="$REPLY"
       if (( i == sel )); then
         zcurses attr modal_win reverse bold magenta/black
-        zcurses string modal_win "$padded"
+        zchat_curses_string modal_win "$padded"
         zcurses attr modal_win -reverse default/default
       else
         zcurses attr modal_win white/black
-        zcurses string modal_win "$padded"
+        zchat_curses_string modal_win "$padded"
       fi
       (( row++ ))
     done
@@ -171,7 +180,7 @@ modal_system_prompt() {
     zcurses move modal_win $(( m_h - 3 )) 2
     zcurses attr modal_win dim white/black
     cur_preview="${SESSION_SYSTEM_PROMPT[1,$(( m_w - 14 ))]}"
-    zcurses string modal_win "Active: \"${cur_preview}...\""
+    zchat_curses_string modal_win "Active: \"${cur_preview}...\""
 
     zcurses refresh modal_win
 
@@ -196,7 +205,7 @@ modal_system_prompt() {
         4) SESSION_SYSTEM_PROMPT="Explain concepts using simple everyday metaphors as if explaining to a 5-year-old." ;;
         5) ;;
       esac
-      state_save_session
+      state_save_session || UI_STATUS_TEXT="Save error"
       break
     elif [[ "$cur_ch" == $'\x1b' || "$cur_ch" == "q" || "$cur_ch" == $'\x03' ]]; then
       break
@@ -245,7 +254,7 @@ modal_show_help() {
   for item in "${help_items[@]}"; do
     zcurses move modal_win $row 2
     zcurses attr modal_win white/black
-    zcurses string modal_win "  $item"
+    zchat_curses_string modal_win "  $item"
     (( row++ ))
     (( row >= m_h - 1 )) && break
   done

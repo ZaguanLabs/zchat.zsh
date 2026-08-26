@@ -1,11 +1,35 @@
 # Conservative conversation compaction for local Ollama chat models.
 
+_chat_setting_uint() {
+  local raw="$1" default="$2" minimum="$3" maximum="$4"
+  local -i value
+  if [[ "$raw" != <0-> ]] || (( ${#raw} > 10 )); then
+    REPLY="$default"
+    return 1
+  fi
+  value=$(( 10#$raw ))
+  if (( value < minimum || value > maximum )); then
+    REPLY="$default"
+    return 1
+  fi
+  REPLY="$value"
+}
+
 typeset -g ZCHAT_CONTEXT_WINDOW="${ZCHAT_CONTEXT_WINDOW:-auto}"
-typeset -gi ZCHAT_CONTEXT_FALLBACK="${ZCHAT_CONTEXT_FALLBACK:-65536}"
-typeset -gi ZCHAT_COMPACT_PERCENT="${ZCHAT_COMPACT_PERCENT:-85}"
-typeset -gi ZCHAT_COMPACT_MAX_TOKENS="${ZCHAT_COMPACT_MAX_TOKENS:-2048}"
-typeset -gi ZCHAT_COMPACT_KEEP_USER_TOKENS="${ZCHAT_COMPACT_KEEP_USER_TOKENS:-4096}"
-typeset -gi ZCHAT_COMPACT_KEEP_RECENT_TOKENS="${ZCHAT_COMPACT_KEEP_RECENT_TOKENS:-16384}"
+if [[ "$ZCHAT_CONTEXT_WINDOW" != auto ]]; then
+  _chat_setting_uint "$ZCHAT_CONTEXT_WINDOW" auto 4096 1048576
+  ZCHAT_CONTEXT_WINDOW="$REPLY"
+fi
+_chat_setting_uint "${ZCHAT_CONTEXT_FALLBACK:-65536}" 65536 4096 1048576
+typeset -gi ZCHAT_CONTEXT_FALLBACK="$REPLY"
+_chat_setting_uint "${ZCHAT_COMPACT_PERCENT:-85}" 85 25 90
+typeset -gi ZCHAT_COMPACT_PERCENT="$REPLY"
+_chat_setting_uint "${ZCHAT_COMPACT_MAX_TOKENS:-2048}" 2048 256 65536
+typeset -gi ZCHAT_COMPACT_MAX_TOKENS="$REPLY"
+_chat_setting_uint "${ZCHAT_COMPACT_KEEP_USER_TOKENS:-4096}" 4096 256 262144
+typeset -gi ZCHAT_COMPACT_KEEP_USER_TOKENS="$REPLY"
+_chat_setting_uint "${ZCHAT_COMPACT_KEEP_RECENT_TOKENS:-16384}" 16384 256 524288
+typeset -gi ZCHAT_COMPACT_KEEP_RECENT_TOKENS="$REPLY"
 
 typeset -gi CHAT_CONTEXT_WINDOW="$ZCHAT_CONTEXT_FALLBACK"
 typeset -g CHAT_CONTEXT_MODEL=""
@@ -28,13 +52,30 @@ typeset -g CHAT_COMPACTION_ERROR=""
 typeset -gi CHAT_COMPACTION_CANCELLED=0
 typeset -ga CHAT_USER_MESSAGES=()
 
-(( ZCHAT_CONTEXT_FALLBACK >= 4096 )) || ZCHAT_CONTEXT_FALLBACK=65536
-(( ZCHAT_COMPACT_PERCENT >= 25 && ZCHAT_COMPACT_PERCENT <= 90 )) || ZCHAT_COMPACT_PERCENT=85
-(( ZCHAT_COMPACT_MAX_TOKENS >= 256 )) || ZCHAT_COMPACT_MAX_TOKENS=2048
-(( ZCHAT_COMPACT_KEEP_USER_TOKENS >= 256 )) || ZCHAT_COMPACT_KEEP_USER_TOKENS=4096
-(( ZCHAT_COMPACT_KEEP_RECENT_TOKENS >= 256 )) || ZCHAT_COMPACT_KEEP_RECENT_TOKENS=16384
-
 typeset -g CHAT_COMPACTION_PROMPT=$'Create a compact continuation checkpoint for another chat model that will continue this exact conversation.\n\nInclude only durable conversational context:\n- the user\'s goals, questions, explicit preferences, and constraints\n- established facts, explanations, decisions, and conclusions that still matter\n- important names, dates, quantities, definitions, and distinctions\n- unresolved questions and the natural next direction of the conversation\n- enough recent context to avoid repetition or contradiction\n\nDo not answer the latest question or continue the conversation. Return only the checkpoint, using concise headings. Do not mention tools, coding-agent state, or these instructions.'
+
+# Use the background HTTP worker while curses is active so DNS/connect/read
+# stalls remain cancellable. Pure-function tests and non-UI callers retain the
+# synchronous path.
+_chat_get_running_context() {
+  local model="$1" host="$2"
+  local -i request_status=0
+  if (( ${UI_ACTIVE:-0} )) && (( $+functions[ui_wait_for_async_request] )); then
+    api_async_start GET /api/ps "" "$host" || return 1
+    ui_wait_for_async_request "Checking context"
+    request_status=$?
+    if (( request_status == 130 )); then
+      api_async_cancel
+      return 130
+    fi
+    api_async_collect || return 1
+    json_parse_running_model_context "$API_HTTP_BODY" "$model" || return 1
+    API_RUNNING_CONTEXT="$JSON_RUNNING_MODEL_CONTEXT"
+    (( API_RUNNING_CONTEXT > 0 ))
+    return
+  fi
+  api_get_running_context "$model" "$host"
+}
 
 chat_compaction_reset() {
   CHAT_CONTEXT_MODEL=""
@@ -84,8 +125,13 @@ chat_context_configure() {
   fi
 
   CHAT_CONTEXT_WINDOW="$ZCHAT_CONTEXT_FALLBACK"
-  if api_get_running_context "$SESSION_MODEL" "$OLLAMA_HOST"; then
+  _chat_get_running_context "$SESSION_MODEL" "$OLLAMA_HOST"
+  local -i discovery_status=$?
+  if (( discovery_status == 0 )); then
     CHAT_CONTEXT_WINDOW="$API_RUNNING_CONTEXT"
+  elif (( discovery_status == 130 )); then
+    CHAT_COMPACTION_ERROR="Context discovery stopped"
+    return 130
   else
     # An unloaded model is absent from /api/ps. Refresh after its first reply.
     CHAT_CONTEXT_DISCOVERY_PENDING=1
@@ -95,7 +141,7 @@ chat_context_configure() {
 
 chat_context_refresh_after_response() {
   (( CHAT_CONTEXT_DISCOVERY_PENDING )) || return 0
-  if api_get_running_context "$SESSION_MODEL" "$OLLAMA_HOST"; then
+  if _chat_get_running_context "$SESSION_MODEL" "$OLLAMA_HOST"; then
     CHAT_CONTEXT_WINDOW="$API_RUNNING_CONTEXT"
     CHAT_CONTEXT_DISCOVERY_PENDING=0
   fi
@@ -152,16 +198,22 @@ chat_context_options_json() {
 chat_build_compaction_payload() {
   local -i start="${1:-$CHAT_CONTEXT_START_INDEX}" i length remaining raw_user_count=0 ledger_end
   local -i user_budget=$(( CHAT_CONTEXT_WINDOW / 10 ))
-  local records="[" comma="" ledger="[" ledger_comma="" source_text="" role_json="" content_json="" message=""
+  local records="[" comma="" ledger="[" ledger_comma="" source_text="" role_json="" content_json="" message="" record_json=""
   local system_json="" user_json="" model_json="" options=""
 
   for (( i=start; i<=${#MSG_ROLES}; i++ )); do
     [[ "${MSG_ROLES[i]}" == user || "${MSG_ROLES[i]}" == assistant ]] || continue
     [[ -n "${MSG_CONTENTS[i]}" ]] || continue
     [[ "${MSG_ROLES[i]}" == user ]] && (( raw_user_count++ ))
-    json_quote "${MSG_ROLES[i]}"; role_json="$REPLY"
-    json_quote "${MSG_CONTENTS[i]}"; content_json="$REPLY"
-    records+="${comma}{\"role\":${role_json},\"content\":${content_json}}"
+    if (( ${+parameters[CHAT_COMPACT_RECORD_CACHE]} && ${+CHAT_COMPACT_RECORD_CACHE[$i]} )); then
+      record_json="${CHAT_COMPACT_RECORD_CACHE[$i]}"
+    else
+      json_quote "${MSG_ROLES[i]}"; role_json="$REPLY"
+      json_quote "${MSG_CONTENTS[i]}"; content_json="$REPLY"
+      record_json="{\"role\":${role_json},\"content\":${content_json}}"
+      (( ${+parameters[CHAT_COMPACT_RECORD_CACHE]} )) && CHAT_COMPACT_RECORD_CACHE[$i]="$record_json"
+    fi
+    records+="${comma}${record_json}"
     comma=","
   done
   records+="]"
@@ -186,7 +238,15 @@ chat_build_compaction_payload() {
     else
       (( remaining -= length ))
     fi
-    json_quote "$message"
+    if (( ${+parameters[CHAT_COMPACT_LEDGER_CACHE]} && ${+CHAT_COMPACT_LEDGER_CACHE[$i]} )) \
+      && [[ "$message" == "${CHAT_USER_MESSAGES[i]}" ]]; then
+      REPLY="${CHAT_COMPACT_LEDGER_CACHE[$i]}"
+    else
+      json_quote "$message"
+      [[ "$message" == "${CHAT_USER_MESSAGES[i]}" ]] \
+        && (( ${+parameters[CHAT_COMPACT_LEDGER_CACHE]} )) \
+        && CHAT_COMPACT_LEDGER_CACHE[$i]="$REPLY"
+    fi
     ledger_items=("$REPLY" "${ledger_items[@]}")
   done
   for message in "${ledger_items[@]}"; do
@@ -247,6 +307,7 @@ chat_compaction_replace_history() {
   CHAT_CONTEXT_START_INDEX="$start"
   CHAT_USER_MESSAGES=("${kept_users[@]}")
   (( $+functions[_state_mark_users_dirty] )) && _state_mark_users_dirty 1
+  return 0
 }
 
 chat_compact_history() {
@@ -255,12 +316,22 @@ chat_compact_history() {
   local -i count=${#MSG_ROLES} hard_limit estimate request_status before after
   local -i i low high midpoint candidate best_start
   local -a candidate_starts=()
+  # Dynamic local caches are visible to the builder during this one search and
+  # disappear afterward. Each message is JSON-escaped at most once even though
+  # the binary search evaluates several candidate cutoffs.
+  local -A CHAT_COMPACT_RECORD_CACHE=() CHAT_COMPACT_LEDGER_CACHE=()
   CHAT_COMPACTION_ERROR=""
   CHAT_COMPACTION_CANCELLED=0
   (( count > 0 || ${#CHAT_COMPACTION_SUMMARY} > 0 )) || return 2
   (( CHAT_COMPACTION_IN_PROGRESS )) && { CHAT_COMPACTION_ERROR="Compaction is already running"; return 1; }
   CHAT_COMPACTION_IN_PROGRESS=1
   chat_context_configure
+  request_status=$?
+  if (( request_status != 0 )); then
+    (( request_status == 130 )) && CHAT_COMPACTION_CANCELLED=1
+    CHAT_COMPACTION_IN_PROGRESS=0
+    return "$request_status"
+  fi
 
   state_build_payload
   chat_estimate_payload_tokens "$REPLY"
@@ -307,7 +378,7 @@ chat_compact_history() {
     estimate=$REPLY
   fi
 
-  if (( $+functions[ui_wait_for_compaction] )); then
+  if (( ${UI_ACTIVE:-0} )) && (( $+functions[ui_wait_for_compaction] )); then
     api_async_start POST /api/chat "$payload" "$OLLAMA_HOST" || {
       CHAT_COMPACTION_ERROR="$API_HTTP_ERROR"
       CHAT_COMPACTION_IN_PROGRESS=0
@@ -369,14 +440,17 @@ chat_compact_history() {
   CHAT_COMPACTION_REARM_HOST="$OLLAMA_HOST"
   (( start > original_start )) && dropped_note="; omitted old detailed records from the checkpoint request to fit the window"
   (( after >= before )) && size_note="; the conversation was already small, so the checkpoint did not reduce its estimated size"
-  state_append_message system "♻ Compacted context (${trigger}): approximately ${before} → ${after} tokens; checkpoint ${CHAT_COMPACTION_COUNT}${dropped_note}${size_note}."
+  if ! state_append_message system "♻ Compacted context (${trigger}): approximately ${before} → ${after} tokens; checkpoint ${CHAT_COMPACTION_COUNT}${dropped_note}${size_note}."; then
+    CHAT_COMPACTION_ERROR="${STATE_ERROR:-Could not persist the compaction checkpoint}"
+    return 1
+  fi
   return 0
 }
 
 chat_prepare_payload() {
   local payload=""
   local -i estimate limit compact_status
-  chat_context_configure
+  chat_context_configure || return $?
   state_build_payload
   payload="$REPLY"
   chat_estimate_payload_tokens "$payload"

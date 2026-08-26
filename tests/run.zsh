@@ -121,6 +121,32 @@ json_parse_ollama_event '{"message":{"content":"done"},"done":true,"prompt_eval_
 assert_eq "done" "$JSON_MESSAGE_CONTENT" "Ollama content is decoded"
 assert_eq "321" "$JSON_MESSAGE_PROMPT_TOKENS" "Ollama prompt usage is decoded"
 assert_eq "22" "$JSON_MESSAGE_OUTPUT_TOKENS" "Ollama output usage is decoded"
+json_parse_ollama_event '{"message":{"content":"done"},"done":true,"prompt_eval_count":999999999999999999999}'
+assert_eq "0" "$JSON_MESSAGE_PROMPT_TOKENS" "oversized JSON usage counters are ignored safely"
+
+typeset unsafe_terminal=$'safe\e]52;c;YXR0YWNr\a\rback\b\nnext\tcolumn'
+zchat_terminal_safe "$unsafe_terminal" 1
+assert_not_contains "$REPLY" $'\e' "terminal sanitizer removes escape controls"
+assert_not_contains "$REPLY" $'\a' "terminal sanitizer removes bell controls"
+assert_not_contains "$REPLY" $'\r' "terminal sanitizer removes carriage returns"
+assert_not_contains "$REPLY" $'\b' "terminal sanitizer removes backspaces"
+assert_contains "$REPLY" $'\nnext' "terminal sanitizer preserves transcript newlines"
+
+typeset invalid_json=$'{"message":{"content":"unsafe\e"},"done":true}'
+if json_parse_ollama_event "$invalid_json"; then fail "JSON rejects unescaped controls"; else pass "JSON rejects unescaped controls"; fi
+if json_parse_ollama_event '{"message":{"content":"x"},"done":true} trailing'; then fail "JSON rejects trailing data"; else pass "JSON rejects trailing data"; fi
+if json_parse_ollama_event '{"message":{"content":"x"},"done":true,"eval_count":01}'; then fail "JSON rejects malformed numbers"; else pass "JSON rejects malformed numbers"; fi
+typeset nested_json='{"ignored":'
+repeat 66; do nested_json+='['; done
+nested_json+='0'
+repeat 66; do nested_json+=']'; done
+nested_json+='}'
+if json_parse_ollama_event "$nested_json"; then fail "JSON nesting is bounded"; else pass "JSON nesting is bounded"; fi
+
+api_normalize_host "localhost:65535"
+assert_eq "localhost:65535" "$REPLY" "host validation accepts the maximum TCP port"
+if api_normalize_host "localhost:65536"; then fail "host validation rejects oversized ports"; else pass "host validation rejects oversized ports"; fi
+if api_normalize_host $'localhost:11434\r\nInjected: yes'; then fail "host validation rejects header controls"; else pass "host validation rejects header controls"; fi
 
 typeset event_dir="${TEST_STATE_DIR}/events"
 zf_mkdir -p "$event_dir"
@@ -359,6 +385,44 @@ printf -v sessions_mode '%o' $(( ${dir_stat[mode]} & 8#777 ))
 assert_eq "600" "$config_mode" "configuration is private"
 assert_eq "700" "$sessions_mode" "session directory is private"
 
+typeset atomic_target="${TEST_STATE_DIR}/atomic-target"
+zf_ln -s /dev/full "$atomic_target"
+if zchat_atomic_write "$atomic_target" "checked" 0600; then pass "atomic writer replaces a hostile leaf symlink"; else fail "atomic writer replaces a hostile leaf symlink"; fi
+[[ ! -L "$atomic_target" ]] && pass "atomic writer leaves a regular file" || fail "atomic writer leaves a regular file"
+zchat_read_file "$atomic_target" 64
+assert_eq "checked" "$REPLY" "atomic writer verifies readable content"
+
+typeset arithmetic_file="${TEST_STATE_DIR}/arithmetic-value"
+typeset -g ARITHMETIC_SENTINEL=0
+mapfile[$arithmetic_file]='ARITHMETIC_SENTINEL=77'
+_state_read_uint "$arithmetic_file" 0 1000
+assert_eq "0" "$ARITHMETIC_SENTINEL" "persisted integers are never recursively evaluated"
+assert_eq "0" "$REPLY" "invalid persisted integers fall back safely"
+
+typeset blocked_target="${ZCHAT_SESSIONS_DIR}/blocked.session"
+zf_ln -s "$TEST_STATE_DIR" "$blocked_target"
+CURRENT_SESSION_ID="blocked"
+STATE_MSG_DIRTY_FROM=1
+if state_save_session; then fail "session save rejects symlink directories"; else pass "session save rejects symlink directories"; fi
+assert_eq "1" "$STATE_MSG_DIRTY_FROM" "failed saves retain dirty bookkeeping"
+zf_rm -f -- "$blocked_target"
+typeset linked_load_dir="${ZCHAT_SESSIONS_DIR}/linked-load.session"
+zf_mkdir -p "$linked_load_dir"
+zchat_atomic_write "$linked_load_dir/message_count" "0" 0600
+zf_ln -s "$TEST_STATE_DIR" "$linked_load_dir/messages"
+if state_load_session 'linked-load'; then fail "session load rejects symlinked message directories"; else pass "session load rejects symlinked message directories"; fi
+zf_rm -rf -- "$linked_load_dir"
+if state_delete_session '../outside'; then fail "session deletion rejects path traversal"; else pass "session deletion rejects path traversal"; fi
+state_load_session "compaction-test"
+
+typeset legacy_escape="${ZCHAT_SESSIONS_DIR}/legacy-safe.json"
+typeset legacy_escape_target="${TEST_STATE_DIR:h}/zchat-escape-${sysparams[pid]:-$$}.session"
+mapfile[$legacy_escape]='{"id":"../../zchat-escape-'"${sysparams[pid]:-$$}"'","title":"Legacy","messages":[]}'
+state_migrate_legacy_sessions
+[[ -d "${ZCHAT_SESSIONS_DIR}/legacy-safe.session" ]] && pass "legacy migration derives a safe filename id" || fail "legacy migration derives a safe filename id"
+[[ ! -e "$legacy_escape_target" ]] && pass "legacy migration cannot escape session storage" || fail "legacy migration cannot escape session storage"
+state_load_session "compaction-test"
+
 ZCHAT_CONTEXT_WINDOW=4096
 CHAT_CONTEXT_WINDOW=4096
 CHAT_CONTEXT_START_INDEX=1
@@ -464,8 +528,25 @@ CHAT_USER_MESSAGES=("${compact_users_after[@]}")
 functions[chat_build_compaction_payload]="${functions[_test_real_compaction_builder]}"
 unfunction _test_real_compaction_builder
 
+typeset saved_context_configure="${functions[chat_context_configure]}"
+chat_context_configure() { CHAT_COMPACTION_ERROR="Context discovery stopped"; return 130; }
+CHAT_COMPACTION_IN_PROGRESS=0
+CHAT_COMPACTION_CANCELLED=0
+if chat_compact_history manual; then fail "manual compaction propagates context cancellation"; else
+  assert_eq "130" "$?" "manual compaction propagates context cancellation"
+fi
+assert_eq "0" "$CHAT_COMPACTION_IN_PROGRESS" "cancelled context discovery clears compaction state"
+assert_eq "1" "$CHAT_COMPACTION_CANCELLED" "cancelled context discovery is reported"
+functions[chat_context_configure]="$saved_context_configure"
+
 source "${PROJECT_DIR}/lib/render.zsh"
 source "${PROJECT_DIR}/lib/ui.zsh"
+
+typeset span_collision_text='before~@~bold red/black~#~after **styled**'
+_render_tokenize_inline "$span_collision_text" "white/black"
+typeset encoded_collision_spans="$REPLY"
+if render_unpack_spans "$encoded_collision_spans"; then pass "inline spans use collision-free framing"; else fail "inline spans use collision-free framing"; fi
+assert_eq 'before~@~bold red/black~#~after styled' "${(j::)RENDER_SPAN_TEXTS}" "inline span framing preserves delimiter-like text"
 SCREEN_H=30
 SCREEN_W=80
 TOP_H=3
@@ -530,6 +611,12 @@ MOCK_ZCURSES_CALLS=()
 ui_refresh_stream
 render_calls="${(j:\n:)MOCK_ZCURSES_CALLS}"
 assert_contains "$render_calls" "refresh top_win chat_win" "stream refresh repaints only changing windows"
+
+typeset hostile_option_version
+hostile_option_version="$(zsh -f -o KSH_ARRAYS "${PROJECT_DIR}/zchat.zsh" --version)"
+assert_eq "zchat.zsh v${ZCHAT_VERSION:-1.0.9}" "$hostile_option_version" "entrypoint resets hostile ambient Zsh options"
+if zsh -f "${PROJECT_DIR}/zchat.zsh" --model >/dev/null 2>&1; then fail "CLI rejects missing option values"; else pass "CLI rejects missing option values"; fi
+if zsh -f "${PROJECT_DIR}/zchat.zsh" --unknown >/dev/null 2>&1; then fail "CLI rejects unknown options"; else pass "CLI rejects unknown options"; fi
 
 print -r -- "1..${TESTS}"
 (( FAILURES == 0 ))

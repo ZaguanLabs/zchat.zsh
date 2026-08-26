@@ -112,16 +112,22 @@ ui_resize_windows() {
   ui_refresh_all 0
 }
 
-# Keep checkpoint generation cancellable even though its Ollama response is
-# deliberately non-streaming. Other editing input waits for the request.
-ui_wait_for_compaction() {
+# Keep non-streaming Ollama metadata and checkpoint requests cancellable. Other
+# editing input waits for the request, while scrolling and resizing stay live.
+ui_wait_for_async_request() {
+  local label="${1:-Working}"
   local ch="" key="" mouse=""
+  local previous_status="$UI_STATUS_TEXT"
+  UI_STATUS_TEXT="$label"
+  ui_draw_header
   while ! api_async_ready; do
     ui_poll_resize
     ch=""; key=""; mouse=""
     zcurses timeout input_win 50
     zcurses input input_win ch key mouse
     if [[ "$ch" == $'\x1b' || "$ch" == $'\x03' ]]; then
+      UI_STATUS_TEXT="$previous_status"
+      ui_draw_header
       return 130
     elif [[ "$key" == "PPAGE" ]]; then
       CHAT_AUTO_SCROLL=0
@@ -133,7 +139,13 @@ ui_wait_for_compaction() {
       ui_draw_chat 0
     fi
   done
+  UI_STATUS_TEXT="$previous_status"
+  ui_draw_header
   return 0
+}
+
+ui_wait_for_compaction() {
+  ui_wait_for_async_request "Compacting"
 }
 
 # Destroy all windows
@@ -193,7 +205,7 @@ ui_plain_transcript() {
     [[ -n "$content" ]] && output+="$content"$'\n'
   done
   [[ -n "$output" ]] || output="(No transcript events yet.)"$'\n'
-  REPLY="$output"
+  zchat_terminal_safe "$output" 1
 }
 
 # Suspend curses so terminal mouse selection and native copy shortcuts work
@@ -232,17 +244,17 @@ ui_draw_header() {
   zcurses move top_win 1 2
 
   zcurses attr top_win bold cyan/black
-  zcurses string top_win "⚡ ${ZCHAT_NAME} v${ZCHAT_VERSION} "
+  zchat_curses_string top_win "⚡ ${ZCHAT_NAME} v${ZCHAT_VERSION} "
   zcurses attr top_win dim white/black
-  zcurses string top_win "│ "
+  zchat_curses_string top_win "│ "
 
   zcurses attr top_win bold white/black
-  zcurses string top_win "Model: "
+  zchat_curses_string top_win "Model: "
   zcurses attr top_win bold yellow/black
-  zcurses string top_win "${SESSION_MODEL}"
+  zchat_curses_string top_win "${SESSION_MODEL}"
 
   zcurses attr top_win dim white/black
-  zcurses string top_win " (${OLLAMA_HOST})"
+  zchat_curses_string top_win " (${OLLAMA_HOST})"
 
   # Status badge on the right
   if (( status_x > 50 )); then
@@ -256,7 +268,7 @@ ui_draw_header() {
     else
       zcurses attr top_win bold green/black
     fi
-    zcurses string top_win "$status_str"
+    zchat_curses_string top_win "$status_str"
   fi
 
   (( defer_refresh )) || zcurses refresh top_win
@@ -282,7 +294,7 @@ ui_draw_sidebar() {
   zcurses border side_win
   zcurses move side_win 0 2
   zcurses attr side_win bold white/black
-  zcurses string side_win " Sessions (${#SESSION_IDS}) "
+  zchat_curses_string side_win " Sessions (${#SESSION_IDS}) "
 
   for (( i=1; i<=total && row<=inner_h; i++ )); do
     s_id="${SESSION_IDS[i]}"
@@ -297,12 +309,12 @@ ui_draw_sidebar() {
       zcurses attr side_win bold green/black
       zchat_pad_right "$display_txt" $(( inner_w - 4 ))
       line_fmt=" ▶ $REPLY"
-      zcurses string side_win "$line_fmt"
+      zchat_curses_string side_win "$line_fmt"
     else
       zcurses attr side_win dim white/black
       zchat_pad_right "$display_txt" $(( inner_w - 4 ))
       line_fmt="   $REPLY"
-      zcurses string side_win "$line_fmt"
+      zchat_curses_string side_win "$line_fmt"
     fi
     (( row++ ))
   done
@@ -311,9 +323,9 @@ ui_draw_sidebar() {
   if (( inner_h - row >= 3 )); then
     zcurses move side_win $(( inner_h - 2 )) 1
     zcurses attr side_win dim cyan/black
-    zcurses string side_win " ^N: New Chat"
+    zchat_curses_string side_win " ^N: New Chat"
     zcurses move side_win $(( inner_h - 1 )) 1
-    zcurses string side_win " ^O: Models"
+    zchat_curses_string side_win " ^O: Models"
   fi
 
   (( defer_refresh )) || zcurses refresh side_win
@@ -338,7 +350,7 @@ ui_draw_chat() {
 
   zcurses move chat_win 0 2
   zcurses attr chat_win bold cyan/black
-  zcurses string chat_win " Chat Transcript (${#MSG_ROLES} msgs) "
+  zchat_curses_string chat_win " Chat Transcript (${#MSG_ROLES} msgs) "
 
   local total_lines=${#RENDERED_LINES}
 
@@ -359,7 +371,7 @@ ui_draw_chat() {
   local row=1 idx=1 current_x=1 pad_len=0
   local line_str="" attr_str="" span_str="" sp="" s_attr="" s_text=""
   local visible_str="" padded="" padding=""
-  local -a spans=() parts=()
+  local -i span_index
 
   for (( row=1; row<=chat_inner_h; row++ )); do
     idx=$(( CHAT_SCROLL_OFFSET + row ))
@@ -372,16 +384,18 @@ ui_draw_chat() {
       zcurses attr chat_win -bold -dim -underline -reverse -standout default/default
 
       if [[ -n "$span_str" ]]; then
-        spans=("${(@s.~@~.)span_str}")
+        if ! render_unpack_spans "$span_str"; then
+          RENDER_SPAN_ATTRS=("$attr_str")
+          RENDER_SPAN_TEXTS=("$line_str")
+        fi
         current_x=1
-        for sp in "${spans[@]}"; do
-          parts=("${(@s.~#~.)sp}")
-          s_attr="${parts[1]:-$attr_str}"
-          s_text="${parts[2]:-}"
+        for (( span_index=1; span_index<=${#RENDER_SPAN_TEXTS}; span_index++ )); do
+          s_attr="${RENDER_SPAN_ATTRS[span_index]:-$attr_str}"
+          s_text="${RENDER_SPAN_TEXTS[span_index]:-}"
           [[ -z "$s_text" ]] && continue
           zcurses attr chat_win -bold -dim -underline -reverse -standout default/default
           zcurses attr chat_win $=s_attr
-          zcurses string chat_win "$s_text"
+          zchat_curses_string chat_win "$s_text"
           (( current_x += ${#s_text} ))
           (( current_x > chat_inner_w )) && break
         done
@@ -391,7 +405,7 @@ ui_draw_chat() {
           padding="$REPLY"
           zcurses attr chat_win -bold -dim -underline -reverse -standout default/default
           zcurses attr chat_win $=attr_str
-          zcurses string chat_win "$padding"
+          zchat_curses_string chat_win "$padding"
         fi
       else
         zcurses attr chat_win -bold -dim -underline -reverse -standout default/default
@@ -399,7 +413,7 @@ ui_draw_chat() {
         visible_str="${line_str[1,$chat_inner_w]}"
         zchat_pad_right "$visible_str" "$chat_inner_w"
         padded="$REPLY"
-        zcurses string chat_win "$padded"
+        zchat_curses_string chat_win "$padded"
       fi
     fi
   done
@@ -408,11 +422,11 @@ ui_draw_chat() {
   if (( total_lines > chat_inner_h && CHAT_SCROLL_OFFSET < total_lines - chat_inner_h )); then
     zcurses move chat_win 0 $(( chat_inner_w - 18 ))
     zcurses attr chat_win bold yellow/black
-    zcurses string chat_win " [▼ Scroll: PgDn] "
+    zchat_curses_string chat_win " [▼ Scroll: PgDn] "
   elif (( CHAT_SCROLL_OFFSET > 0 )); then
     zcurses move chat_win 0 $(( chat_inner_w - 18 ))
     zcurses attr chat_win dim white/black
-    zcurses string chat_win " [▲ Scrolled Up] "
+    zchat_curses_string chat_win " [▲ Scrolled Up] "
   fi
 
   (( defer_refresh )) || zcurses refresh chat_win
@@ -441,7 +455,7 @@ ui_draw_input() {
   if (( total > INPUT_VISIBLE_ROWS )); then
     title=" Prompt (Enter sends · Shift-Enter newline · ${INPUT_VIEW_TOP}-$(( INPUT_VIEW_TOP + INPUT_VISIBLE_ROWS - 1 ))/${total}) "
   fi
-  zcurses string input_win "${title[1,$(( SCREEN_W - 4 ))]}"
+  zchat_curses_string input_win "${title[1,$(( SCREEN_W - 4 ))]}"
 
   for (( row=1; row<=INPUT_VISIBLE_ROWS; row++ )); do
     visual_row=$(( INPUT_VIEW_TOP + row - 1 ))
@@ -452,9 +466,9 @@ ui_draw_input() {
     (( row == INPUT_VISIBLE_ROWS && visual_row < total )) && marker="↓"
     zcurses move input_win $row 2
     zcurses attr input_win bold green/black
-    zcurses string input_win "$marker "
+    zchat_curses_string input_win "$marker "
     zcurses attr input_win white/black
-    zcurses string input_win "$visible"
+    zchat_curses_string input_win "$visible"
   done
 
   cursor_y=$(( INPUT_CURSOR_ROW - INPUT_VIEW_TOP + 1 ))
@@ -489,7 +503,7 @@ ui_draw_footer() {
   zchat_pad_right "$bar_str" "$SCREEN_W"
   padded="$REPLY"
   zcurses move foot_win 0 0
-  zcurses string foot_win "$padded"
+  zchat_curses_string foot_win "$padded"
   zcurses attr foot_win -reverse default/default
   (( defer_refresh )) || zcurses refresh foot_win
 }

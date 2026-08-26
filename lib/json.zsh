@@ -28,6 +28,19 @@ typeset -ga JSON_SESSION_CONTENTS=()
 typeset -ga JSON_SESSION_THINKINGS=()
 typeset -ga JSON_SESSION_EXPANDED=()
 typeset -ga JSON_SESSION_TIMES=()
+typeset -gr JSON_MAX_DOCUMENT_CHARS=16777216
+typeset -gr JSON_MAX_DEPTH=64
+
+# Convert an untrusted JSON integer without allowing recursive arithmetic or
+# oversized decimal strings into an integer parameter.
+_json_safe_uint() {
+  local raw="$1" maximum="${2:-1000000000}"
+  local -i value
+  [[ "$raw" == <0-> && ${#raw} -le 10 ]] || return 1
+  value=$(( 10#$raw ))
+  (( value <= maximum )) || return 1
+  REPLY=$value
+}
 
 # Encode a string as a JSON string literal. Result is returned in REPLY.
 json_quote() {
@@ -70,7 +83,19 @@ json_begin() {
   JSON_TOKEN_TYPE=""
   JSON_TOKEN_VALUE=""
   JSON_ERROR=""
+  if (( ${#JSON_SOURCE} > JSON_MAX_DOCUMENT_CHARS )); then
+    JSON_ERROR="JSON document exceeded the ${JSON_MAX_DOCUMENT_CHARS}-character limit"
+    return 1
+  fi
   json_next
+}
+
+json_finish() {
+  json_next || return 1
+  if [[ "$JSON_TOKEN_TYPE" != eof ]]; then
+    JSON_ERROR="trailing data after JSON document"
+    return 1
+  fi
 }
 
 # Advance the tokenizer by one JSON token.
@@ -103,7 +128,14 @@ json_next() {
         # Find the next quote or escape without visiting every character.
         stop=${JSON_SOURCE[(ib:JSON_POS:)[\"\\\\]]}
         (( stop > JSON_LEN )) && break
-        (( stop > JSON_POS )) && value+="${JSON_SOURCE[JSON_POS,stop-1]}"
+        if (( stop > JSON_POS )); then
+          local segment="${JSON_SOURCE[JSON_POS,stop-1]}"
+          if [[ "$segment" == *[$'\x01'-$'\x1f']* ]]; then
+            JSON_ERROR="unescaped control character in JSON string"
+            return 1
+          fi
+          value+="$segment"
+        fi
         ch="${JSON_SOURCE[stop]}"
         JSON_POS=$(( stop + 1 ))
         if [[ "$ch" == '"' ]]; then
@@ -127,7 +159,7 @@ json_next() {
           t) value+=$'\t' ;;
           u)
             hex="${JSON_SOURCE[JSON_POS,$(( JSON_POS + 3 ))]}"
-            if [[ "$hex" != [[:xdigit:]]## ]]; then
+            if (( ${#hex} != 4 )) || [[ "$hex" != [[:xdigit:]]## ]]; then
               JSON_ERROR="invalid JSON unicode escape"
               return 1
             fi
@@ -145,6 +177,11 @@ json_next() {
                   (( JSON_POS += 6 ))
                 fi
               fi
+            fi
+
+            if (( cp >= 0xD800 && cp <= 0xDFFF )); then
+              JSON_ERROR="unpaired JSON unicode surrogate"
+              return 1
             fi
 
             if (( cp <= 0xFFFF )); then
@@ -168,6 +205,10 @@ json_next() {
       stop=${JSON_SOURCE[(ib:JSON_POS:)[^0-9eE+.-]]}
       value="${JSON_SOURCE[JSON_POS,stop-1]}"
       JSON_POS=$stop
+      if [[ ! "$value" =~ '^-?(0|[1-9][0-9]*)([.][0-9]+)?([eE][+-]?[0-9]+)?$' ]]; then
+        JSON_ERROR="invalid JSON number"
+        return 1
+      fi
       JSON_TOKEN_TYPE="number"
       JSON_TOKEN_VALUE="$value"
       return 0
@@ -195,6 +236,11 @@ json_next() {
 # Skip the value at the current token, leaving the next token current.
 json_skip_value() {
   local depth_type="$JSON_TOKEN_TYPE"
+  local -i depth="${1:-0}"
+  if (( depth > JSON_MAX_DEPTH )); then
+    JSON_ERROR="JSON nesting exceeded ${JSON_MAX_DEPTH} levels"
+    return 1
+  fi
 
   case "$depth_type" in
     string|number|true|false|null)
@@ -207,7 +253,7 @@ json_skip_value() {
         json_next || return 1
         [[ "$JSON_TOKEN_TYPE" == ':' ]] || return 1
         json_next || return 1
-        json_skip_value || return 1
+        json_skip_value $(( depth + 1 )) || return 1
         if [[ "$JSON_TOKEN_TYPE" == ',' ]]; then
           json_next || return 1
         elif [[ "$JSON_TOKEN_TYPE" != '}' ]]; then
@@ -219,7 +265,7 @@ json_skip_value() {
     '[')
       json_next || return 1
       while [[ "$JSON_TOKEN_TYPE" != ']' ]]; do
-        json_skip_value || return 1
+        json_skip_value $(( depth + 1 )) || return 1
         if [[ "$JSON_TOKEN_TYPE" == ',' ]]; then
           json_next || return 1
         elif [[ "$JSON_TOKEN_TYPE" != ']' ]]; then
@@ -286,11 +332,11 @@ json_parse_ollama_event() {
       done:false) JSON_MESSAGE_DONE=0; json_next || return 1 ;;
       error:string) JSON_MESSAGE_ERROR="$JSON_TOKEN_VALUE"; json_next || return 1 ;;
       prompt_eval_count:number)
-        [[ "$JSON_TOKEN_VALUE" == <0-> ]] && JSON_MESSAGE_PROMPT_TOKENS="$JSON_TOKEN_VALUE"
+        _json_safe_uint "$JSON_TOKEN_VALUE" && JSON_MESSAGE_PROMPT_TOKENS="$REPLY"
         json_next || return 1
         ;;
       eval_count:number)
-        [[ "$JSON_TOKEN_VALUE" == <0-> ]] && JSON_MESSAGE_OUTPUT_TOKENS="$JSON_TOKEN_VALUE"
+        _json_safe_uint "$JSON_TOKEN_VALUE" && JSON_MESSAGE_OUTPUT_TOKENS="$REPLY"
         json_next || return 1
         ;;
       *) json_skip_value || return 1 ;;
@@ -303,7 +349,7 @@ json_parse_ollama_event() {
     fi
   done
 
-  return 0
+  json_finish
 }
 
 # Decode the flat zchat configuration object.
@@ -335,6 +381,7 @@ json_parse_config() {
       return 1
     fi
   done
+  json_finish
 }
 
 _json_parse_model_object() {
@@ -398,6 +445,7 @@ json_parse_models() {
       return 1
     fi
   done
+  json_finish
 }
 
 _json_model_names_match() {
@@ -422,7 +470,7 @@ _json_parse_running_model() {
       name:string) name="$JSON_TOKEN_VALUE"; json_next || return 1 ;;
       model:string) model="$JSON_TOKEN_VALUE"; json_next || return 1 ;;
       context_length:number)
-        [[ "$JSON_TOKEN_VALUE" == <1-> ]] && context_length="$JSON_TOKEN_VALUE"
+        _json_safe_uint "$JSON_TOKEN_VALUE" 1048576 && (( REPLY > 0 )) && context_length="$REPLY"
         json_next || return 1
         ;;
       *) json_skip_value || return 1 ;;
@@ -472,7 +520,7 @@ json_parse_running_model_context() {
       return 1
     fi
   done
-  return 0
+  json_finish
 }
 
 _json_parse_session_message() {
@@ -564,4 +612,5 @@ json_parse_session() {
       return 1
     fi
   done
+  json_finish
 }

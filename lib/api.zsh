@@ -20,6 +20,15 @@ typeset -gi API_RUNNING_CONTEXT=0
 typeset -g API_ASYNC_PID=""
 typeset -g API_ASYNC_BASE=""
 typeset -ga API_MODELS=()
+typeset -gr API_METADATA_TIMEOUT=10
+typeset -gr API_CHAT_TIMEOUT=300
+typeset -gr API_MAX_HEADER_BYTES=65536
+typeset -gr API_MAX_METADATA_BYTES=8388608
+typeset -gr API_MAX_CHAT_BODY_BYTES=16777216
+typeset -gr API_MAX_REQUEST_BYTES=67108864
+typeset -gr API_MAX_STREAM_BYTES=134217728
+typeset -gr API_MAX_HTTP_CHUNK_BYTES=16777216
+typeset -gr API_MAX_NDJSON_EVENT_BYTES=8388608
 
 # Create one private runtime directory for all request handoff files. Using an
 # atomically-created directory avoids predictable /tmp files and symlink races.
@@ -57,7 +66,7 @@ api_runtime_cleanup() {
 # Accept either host:port or an http:// URL and return a canonical endpoint in
 # REPLY. The native transport intentionally supports plain HTTP only.
 api_normalize_host() {
-  local endpoint="$1"
+  local endpoint="$1" host_part="" port_part=""
   API_HOST_ERROR=""
   endpoint="${endpoint##[[:space:]]#}"
   endpoint="${endpoint%%[[:space:]]#}"
@@ -69,7 +78,7 @@ api_normalize_host() {
   endpoint="${endpoint#http://}"
   endpoint="${endpoint%/}"
 
-  if [[ -z "$endpoint" || "$endpoint" == */* || "$endpoint" == *[[:space:]]* ]]; then
+  if [[ -z "$endpoint" || "$endpoint" == */* || "$endpoint" == *[[:space:]]* ]] || (( ${#endpoint} > 1024 )); then
     API_HOST_ERROR="expected http://hostname:port or hostname:port"
     return 1
   fi
@@ -83,6 +92,27 @@ api_normalize_host() {
     return 1
   else
     endpoint+=":11434"
+  fi
+
+  if [[ "$endpoint" == \[*\]:<-> ]]; then
+    host_part="${endpoint#\[}"
+    host_part="${host_part%%\]*}"
+    port_part="${endpoint##*:}"
+    [[ -n "$host_part" && "$host_part" != *[^[:xdigit:]:.%[:alnum:]_-]* ]] || {
+      API_HOST_ERROR="invalid bracketed IPv6 host"
+      return 1
+    }
+  else
+    host_part="${endpoint%:*}"
+    port_part="${endpoint##*:}"
+    [[ -n "$host_part" && "$host_part" != *[^[:alnum:]._-]* ]] || {
+      API_HOST_ERROR="invalid hostname"
+      return 1
+    }
+  fi
+  if (( ${#port_part} > 5 )) || (( 10#$port_part < 1 || 10#$port_part > 65535 )); then
+    API_HOST_ERROR="port must be between 1 and 65535"
+    return 1
   fi
 
   REPLY="$endpoint"
@@ -122,10 +152,11 @@ _api_dechunk() {
     size_line="${wire%%$'\r\n'*}"
     wire="${wire[$(( ${#size_line} + 3 )),-1]}"
     hex="${size_line%%;*}"
-    [[ "$hex" == [[:xdigit:]]## ]] || return 1
+    [[ "$hex" == [[:xdigit:]]## ]] && (( ${#hex} <= 8 )) || return 1
     size=$(( 16#$hex ))
     (( size == 0 )) && break
     (( ${#wire} >= size + 2 )) || return 1
+    [[ "${wire[$(( size + 1 )),$(( size + 2 ))]}" == $'\r\n' ]] || return 1
     data="${wire[1,$size]}"
     output+="$data"
     wire="${wire[$(( size + 3 )),-1]}"
@@ -136,7 +167,7 @@ _api_dechunk() {
 
 # Perform a complete HTTP GET for Ollama model metadata.
 _api_http_get() {
-  _api_http_request GET "$2" "" "$1"
+  _api_http_request GET "$2" "" "$1" "$API_METADATA_TIMEOUT" "$API_MAX_METADATA_BYTES"
 }
 
 # Perform one complete HTTP request for model metadata and non-streaming
@@ -144,12 +175,20 @@ _api_http_get() {
 _api_http_request() {
   setopt localoptions nomultibyte
   local method="$1" path="$2" payload="${3:-}" endpoint="${4:-$OLLAMA_HOST}"
+  local timeout="${5:-$API_CHAT_TIMEOUT}" max_body="${6:-$API_MAX_CHAT_BODY_BYTES}"
   local fd="" request="" chunk="" raw="" header="" body=""
-  local status_line=""
-  local -i payload_bytes
+  local status_line="" http_version="" http_code=""
+  local -i payload_bytes read_status raw_bytes
 
   API_HTTP_BODY=""
   API_HTTP_ERROR=""
+
+  _api_byte_length "$payload"
+  payload_bytes=$REPLY
+  if (( payload_bytes > API_MAX_REQUEST_BYTES )); then
+    API_HTTP_ERROR="Ollama request exceeded the ${API_MAX_REQUEST_BYTES}-byte limit"
+    return 1
+  fi
 
   _api_split_host "$endpoint"
   if ! ztcp "$API_NET_HOST" "$API_NET_PORT" 2>/dev/null; then
@@ -158,21 +197,40 @@ _api_http_request() {
   fi
   fd=$REPLY
 
-  _api_byte_length "$payload"
-  payload_bytes=$REPLY
   request="${method} ${path} HTTP/1.1"$'\r\n'"Host: ${endpoint}"$'\r\n'\
 "Content-Type: application/json"$'\r\n'"Accept: application/json"$'\r\n'\
 "Connection: close"$'\r\n'"Content-Length: ${payload_bytes}"$'\r\n\r\n'"${payload}"
-  if ! syswrite -o "$fd" "$request" 2>/dev/null; then
+  if ! zchat_write_all "$fd" "$request"; then
     API_HTTP_ERROR="Failed to send request to Ollama"
     ztcp -c "$fd" 2>/dev/null
     return 1
   fi
 
-  while sysread -i "$fd" -s 32768 -t 300 chunk 2>/dev/null; do
+  while true; do
+    sysread -i "$fd" -s 32768 -t "$timeout" chunk 2>/dev/null
+    read_status=$?
+    (( read_status == 0 )) || break
     raw+="$chunk"
+    raw_bytes=${#raw}
+    if (( raw_bytes > max_body + API_MAX_HEADER_BYTES )); then
+      API_HTTP_ERROR="Ollama response exceeded the ${max_body}-byte limit"
+      ztcp -c "$fd" 2>/dev/null
+      return 1
+    fi
+    if [[ "$raw" != *$'\r\n\r\n'* ]] && (( raw_bytes > API_MAX_HEADER_BYTES )); then
+      API_HTTP_ERROR="Ollama HTTP headers exceeded the ${API_MAX_HEADER_BYTES}-byte limit"
+      ztcp -c "$fd" 2>/dev/null
+      return 1
+    fi
   done
   ztcp -c "$fd" 2>/dev/null
+  if (( read_status == 4 )); then
+    API_HTTP_ERROR="Ollama response timed out after ${timeout} seconds"
+    return 1
+  elif (( read_status != 5 )); then
+    API_HTTP_ERROR="Failed while reading the Ollama response"
+    return 1
+  fi
 
   [[ "$raw" == *$'\r\n\r\n'* ]] || {
     API_HTTP_ERROR="Ollama returned an incomplete HTTP response"
@@ -180,8 +238,14 @@ _api_http_request() {
   }
   header="${raw%%$'\r\n\r\n'*}"
   body="${raw[$(( ${#header} + 5 )),-1]}"
+  (( ${#body} <= max_body )) || {
+    API_HTTP_ERROR="Ollama response body exceeded the ${max_body}-byte limit"
+    return 1
+  }
   status_line="${header%%$'\r\n'*}"
-  if [[ "$status_line" != 'HTTP/'*' 2'* ]]; then
+  http_version="${status_line%% *}"
+  http_code="${${status_line#* }%% *}"
+  if [[ "$http_version" != HTTP/<->.<-> || "$http_code" != 2[0-9][0-9] ]]; then
     API_HTTP_ERROR="Ollama HTTP error: ${status_line}"
     API_HTTP_BODY="$body"
     return 1
@@ -217,7 +281,8 @@ api_get_running_context() {
 }
 
 api_chat_sync() {
-  _api_http_request POST "/api/chat" "$1" "${2:-$OLLAMA_HOST}"
+  _api_http_request POST "/api/chat" "$1" "${2:-$OLLAMA_HOST}" \
+    "$API_CHAT_TIMEOUT" "$API_MAX_CHAT_BODY_BYTES"
 }
 
 api_async_cleanup() {
@@ -234,6 +299,11 @@ api_async_cleanup() {
 # active, allowing Escape/Ctrl+C, scrolling, and resize handling to continue.
 api_async_start() {
   local method="$1" path="$2" payload="${3:-}" endpoint="${4:-$OLLAMA_HOST}"
+  local timeout="$API_CHAT_TIMEOUT" max_body="$API_MAX_CHAT_BODY_BYTES"
+  if [[ "$method" == GET ]]; then
+    timeout="$API_METADATA_TIMEOUT"
+    max_body="$API_MAX_METADATA_BYTES"
+  fi
   api_runtime_init || return 1
   local base="${API_RUNTIME_DIR}/http_${EPOCHREALTIME//./_}_${RANDOM}"
   API_HTTP_ERROR=""
@@ -244,15 +314,15 @@ api_async_start() {
   api_async_cleanup
   API_ASYNC_BASE="$base"
   (
-    trap - EXIT
+    trap - EXIT INT TERM HUP
     local -i request_status=0
     API_HTTP_BODY=""
     API_HTTP_ERROR=""
-    _api_http_request "$method" "$path" "$payload" "$endpoint" || request_status=$?
-    mapfile[${base}.body]="$API_HTTP_BODY"
-    mapfile[${base}.error]="$API_HTTP_ERROR"
-    mapfile[${base}.status]="$request_status"
-    mapfile[${base}.done]="done"
+    _api_http_request "$method" "$path" "$payload" "$endpoint" "$timeout" "$max_body" || request_status=$?
+    zchat_atomic_write "${base}.body" "$API_HTTP_BODY" 0600 || request_status=1
+    zchat_atomic_write "${base}.error" "$API_HTTP_ERROR" 0600 || request_status=1
+    zchat_atomic_write "${base}.status" "$request_status" 0600 || request_status=1
+    zchat_atomic_write "${base}.done" "done" 0600 || request_status=1
     exit "$request_status"
   ) </dev/null >/dev/null 2>&1 &
   API_ASYNC_PID=$!
@@ -270,9 +340,9 @@ api_async_collect() {
   API_HTTP_ERROR=""
   [[ -n "$base" ]] || { API_HTTP_ERROR="No Ollama request is running"; return 1; }
   if [[ -f "${base}.done" ]]; then
-    API_HTTP_BODY="${mapfile[${base}.body]-}"
-    API_HTTP_ERROR="${mapfile[${base}.error]-}"
-    request_status="${mapfile[${base}.status]-1}"
+    zchat_read_file "${base}.body" "$API_MAX_CHAT_BODY_BYTES" && API_HTTP_BODY="$REPLY"
+    zchat_read_file "${base}.error" "$API_MAX_METADATA_BYTES" && API_HTTP_ERROR="$REPLY"
+    zchat_read_file "${base}.status" 16 && request_status="$REPLY"
   else
     API_HTTP_ERROR="Ollama request worker exited before returning a result"
   fi
@@ -310,39 +380,39 @@ _api_process_event_line() {
   fi
   if (( JSON_MESSAGE_DONE )); then
     API_STREAM_SAW_DONE=1
-    print -r -u "$ufd" -- "${JSON_MESSAGE_PROMPT_TOKENS} ${JSON_MESSAGE_OUTPUT_TOKENS}"
+    print -r -u "$ufd" -- "${JSON_MESSAGE_PROMPT_TOKENS} ${JSON_MESSAGE_OUTPUT_TOKENS}" || return 1
   fi
 
   t="$JSON_MESSAGE_THINKING"
   c="$JSON_MESSAGE_CONTENT"
-  [[ -n "$t" ]] && print -rn -u "$tfd" -- "$t"
+  [[ -n "$t" ]] && print -rn -u "$tfd" -- "$t" || [[ -z "$t" ]] || return 1
 
   if [[ -n "$c" ]]; then
     if [[ "$c" == *'<think>'* ]]; then
-      print -rn -u "$cfd" -- "${c%%'<think>'*}"
+      print -rn -u "$cfd" -- "${c%%'<think>'*}" || return 1
       rest="${c#*'<think>'}"
       if [[ "$rest" == *'</think>'* ]]; then
         t_part="${rest%%'</think>'*}"
         c_part="${rest#*'</think>'}"
-        print -rn -u "$tfd" -- "$t_part"
-        print -rn -u "$cfd" -- "$c_part"
+        print -rn -u "$tfd" -- "$t_part" || return 1
+        print -rn -u "$cfd" -- "$c_part" || return 1
         API_IN_THINK_TAG=0
       else
-        print -rn -u "$tfd" -- "$rest"
+        print -rn -u "$tfd" -- "$rest" || return 1
         API_IN_THINK_TAG=1
       fi
     elif (( API_IN_THINK_TAG )); then
       if [[ "$c" == *'</think>'* ]]; then
         t_part="${c%%'</think>'*}"
         c_part="${c#*'</think>'}"
-        print -rn -u "$tfd" -- "$t_part"
-        print -rn -u "$cfd" -- "$c_part"
+        print -rn -u "$tfd" -- "$t_part" || return 1
+        print -rn -u "$cfd" -- "$c_part" || return 1
         API_IN_THINK_TAG=0
       else
-        print -rn -u "$tfd" -- "$c"
+        print -rn -u "$tfd" -- "$c" || return 1
       fi
     else
-      print -rn -u "$cfd" -- "$c"
+      print -rn -u "$cfd" -- "$c" || return 1
     fi
   fi
 }
@@ -351,6 +421,10 @@ _api_consume_ndjson() {
   local data="$1" tfd="$2" cfd="$3" efd="$4" ufd="$5"
   local line=""
   API_NDJSON_BUFFER+="$data"
+  if (( ${#API_NDJSON_BUFFER} > API_MAX_NDJSON_EVENT_BYTES )); then
+    print -r -u "$efd" -- "Ollama NDJSON event exceeded the ${API_MAX_NDJSON_EVENT_BYTES}-byte limit"
+    return 1
+  fi
   while [[ "$API_NDJSON_BUFFER" == *$'\n'* ]]; do
     line="${API_NDJSON_BUFFER%%$'\n'*}"
     API_NDJSON_BUFFER="${API_NDJSON_BUFFER[$(( ${#line} + 2 )),-1]}"
@@ -365,40 +439,61 @@ _api_http_stream() {
   setopt localoptions extendedglob nomultibyte
   local endpoint="$1" payload="$2" t_file="$3" c_file="$4" err_file="$5" usage_file="$6"
   local fd="" tfd="" cfd="" efd="" ufd=""
-  local request="" chunk="" header="" status_line="" size_line="" hex="" data=""
+  local request="" chunk="" header="" status_line="" http_version="" http_code="" size_line="" hex="" data=""
   local wire=""
-  local -i headers_done=0 chunked=0 expected=-1 payload_bytes
+  local -i headers_done=0 chunked=0 expected=-1 payload_bytes total_bytes=0 read_status=0
 
   API_NDJSON_BUFFER=""
   API_IN_THINK_TAG=0
   API_STREAM_SAW_DONE=0
   exec {tfd}>"$t_file" {cfd}>"$c_file" {efd}>>"$err_file" {ufd}>"$usage_file" || return 1
 
+  {
+  _api_byte_length "$payload"
+  payload_bytes=$REPLY
+  if (( payload_bytes > API_MAX_REQUEST_BYTES )); then
+    print -r -u "$efd" -- "Ollama request exceeded the ${API_MAX_REQUEST_BYTES}-byte limit"
+    return 1
+  fi
   _api_split_host "$endpoint"
   if ! ztcp "$API_NET_HOST" "$API_NET_PORT" 2>/dev/null; then
     print -r -u "$efd" -- "Failed to connect to Ollama at $endpoint"
     return 1
   fi
   fd=$REPLY
-  _api_byte_length "$payload"
-  payload_bytes=$REPLY
   request=$'POST /api/chat HTTP/1.1\r\nHost: '"$endpoint"$'\r\nContent-Type: application/json\r\nAccept: application/x-ndjson\r\nConnection: close\r\nContent-Length: '"$payload_bytes"$'\r\n\r\n'"$payload"
 
-  if ! syswrite -o "$fd" "$request" 2>/dev/null; then
+  if ! zchat_write_all "$fd" "$request"; then
     print -r -u "$efd" -- "Failed to send request to Ollama"
     ztcp -c "$fd" 2>/dev/null
     return 1
   fi
 
-  while sysread -i "$fd" -s 16384 -t 300 chunk 2>/dev/null; do
+  while true; do
+    sysread -i "$fd" -s 16384 -t "$API_CHAT_TIMEOUT" chunk 2>/dev/null
+    read_status=$?
+    (( read_status == 0 )) || break
+    (( total_bytes += ${#chunk} ))
+    if (( total_bytes > API_MAX_STREAM_BYTES )); then
+      print -r -u "$efd" -- "Ollama stream exceeded the ${API_MAX_STREAM_BYTES}-byte limit"
+      ztcp -c "$fd" 2>/dev/null
+      return 1
+    fi
     wire+="$chunk"
 
     if (( ! headers_done )); then
+      if [[ "$wire" != *$'\r\n\r\n'* ]] && (( ${#wire} > API_MAX_HEADER_BYTES )); then
+        print -r -u "$efd" -- "Ollama HTTP headers exceeded the ${API_MAX_HEADER_BYTES}-byte limit"
+        ztcp -c "$fd" 2>/dev/null
+        return 1
+      fi
       [[ "$wire" == *$'\r\n\r\n'* ]] || continue
       header="${wire%%$'\r\n\r\n'*}"
       wire="${wire[$(( ${#header} + 5 )),-1]}"
       status_line="${header%%$'\r\n'*}"
-      if [[ "$status_line" != 'HTTP/'*' 2'* ]]; then
+      http_version="${status_line%% *}"
+      http_code="${${status_line#* }%% *}"
+      if [[ "$http_version" != HTTP/<->.<-> || "$http_code" != 2[0-9][0-9] ]]; then
         print -r -u "$efd" -- "Ollama HTTP error: $status_line"
         ztcp -c "$fd" 2>/dev/null
         return 1
@@ -414,16 +509,26 @@ _api_http_stream() {
           size_line="${wire%%$'\r\n'*}"
           wire="${wire[$(( ${#size_line} + 3 )),-1]}"
           hex="${size_line%%;*}"
-          if [[ "$hex" != [[:xdigit:]]## ]]; then
+          if [[ "$hex" != [[:xdigit:]]## ]] || (( ${#hex} > 8 )); then
             print -r -u "$efd" -- "Invalid HTTP chunk size"
             ztcp -c "$fd" 2>/dev/null
             return 1
           fi
           expected=$(( 16#$hex ))
           (( expected == 0 )) && break 2
+          if (( expected > API_MAX_HTTP_CHUNK_BYTES )); then
+            print -r -u "$efd" -- "Ollama HTTP chunk exceeded the ${API_MAX_HTTP_CHUNK_BYTES}-byte limit"
+            ztcp -c "$fd" 2>/dev/null
+            return 1
+          fi
         fi
 
         (( ${#wire} >= expected + 2 )) || break
+        if [[ "${wire[$(( expected + 1 )),$(( expected + 2 ))]}" != $'\r\n' ]]; then
+          print -r -u "$efd" -- "Invalid HTTP chunk terminator"
+          ztcp -c "$fd" 2>/dev/null
+          return 1
+        fi
         data="${wire[1,$expected]}"
         wire="${wire[$(( expected + 3 )),-1]}"
         expected=-1
@@ -443,20 +548,31 @@ _api_http_stream() {
       (( API_STREAM_SAW_DONE )) && break
     fi
   done
-
-  ztcp -c "$fd" 2>/dev/null
+  if (( ! API_STREAM_SAW_DONE && read_status == 4 )); then
+    print -r -u "$efd" -- "Ollama stream timed out after ${API_CHAT_TIMEOUT} seconds"
+    return 1
+  elif (( ! API_STREAM_SAW_DONE && read_status != 5 )); then
+    print -r -u "$efd" -- "Failed while reading the Ollama stream"
+    return 1
+  fi
   if [[ -n "$API_NDJSON_BUFFER" ]]; then
     _api_process_event_line "${API_NDJSON_BUFFER%$'\r'}" "$tfd" "$cfd" "$efd" "$ufd" || return 1
   fi
-  exec {tfd}>&- {cfd}>&- {efd}>&- {ufd}>&-
   if (( ! headers_done )); then
-    mapfile[$err_file]="Ollama returned an incomplete HTTP response"
+    print -r -u "$efd" -- "Ollama returned an incomplete HTTP response"
     return 1
   fi
   if (( ! API_STREAM_SAW_DONE )); then
-    mapfile[$err_file]="Ollama closed the response before its final event"
+    print -r -u "$efd" -- "Ollama closed the response before its final event"
     return 1
   fi
+  } always {
+    [[ -n "$fd" ]] && ztcp -c "$fd" 2>/dev/null
+    [[ -n "$tfd" ]] && exec {tfd}>&- 2>/dev/null
+    [[ -n "$cfd" ]] && exec {cfd}>&- 2>/dev/null
+    [[ -n "$efd" ]] && exec {efd}>&- 2>/dev/null
+    [[ -n "$ufd" ]] && exec {ufd}>&- 2>/dev/null
+  }
 }
 
 # Start a background chat stream. The PID is returned through API_STREAM_PID.
@@ -478,19 +594,22 @@ api_start_stream() {
     return 1
   fi
 
-  : > "$t_file"
-  : > "$c_file"
+  zchat_atomic_write "$t_file" "" 0600 || { API_STREAM_ERROR="Could not create stream handoff files"; return 1; }
+  zchat_atomic_write "$c_file" "" 0600 || { API_STREAM_ERROR="Could not create stream handoff files"; return 1; }
   zf_rm -f "$done_file"
-  : > "$err_file"
-  : > "$usage_file"
-  : > "$status_file"
+  zchat_atomic_write "$err_file" "" 0600 || { API_STREAM_ERROR="Could not create stream handoff files"; return 1; }
+  zchat_atomic_write "$usage_file" "" 0600 || { API_STREAM_ERROR="Could not create stream handoff files"; return 1; }
+  zchat_atomic_write "$status_file" "1" 0600 || { API_STREAM_ERROR="Could not create stream handoff files"; return 1; }
 
   (
-    trap - EXIT
+    trap - EXIT INT TERM HUP
     local -i stream_status=0
     _api_http_stream "$host" "$payload" "$t_file" "$c_file" "$err_file" "$usage_file" || stream_status=$?
-    mapfile[$status_file]="$stream_status"
-    print -r -- "DONE" > "$done_file"
+    zchat_atomic_write "$status_file" "$stream_status" 0600 || stream_status=1
+    if ! zchat_atomic_write "$done_file" "DONE" 0600; then
+      stream_status=1
+      zchat_atomic_write "$status_file" "$stream_status" 0600 || true
+    fi
     exit "$stream_status"
   ) </dev/null >/dev/null &
 
@@ -538,9 +657,12 @@ api_stream_read_updates() {
 api_stream_collect() {
   local pid="$1" base_file="$2"
   local status_file="${base_file}.status" err_file="${base_file}.err"
-  API_STREAM_STATUS="${mapfile[$status_file]:-1}"
-  [[ "$API_STREAM_STATUS" == <0-255> ]] || API_STREAM_STATUS=1
-  API_STREAM_ERROR="${mapfile[$err_file]}"
+  local status_value="1"
+  API_STREAM_ERROR=""
+  zchat_read_file "$status_file" 16 && status_value="$REPLY"
+  [[ "$status_value" == <0-255> ]] || status_value=1
+  API_STREAM_STATUS="$status_value"
+  zchat_read_file "$err_file" "$API_MAX_METADATA_BYTES" && API_STREAM_ERROR="$REPLY"
   [[ -n "$pid" ]] && wait "$pid" 2>/dev/null
   API_STREAM_PID=""
   (( API_STREAM_STATUS == 0 )) || {

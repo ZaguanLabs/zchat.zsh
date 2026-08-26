@@ -3,10 +3,13 @@
 # zchat.zsh - Interactive AI Terminal Chat Interface in Pure ZSH & Curses
 # ==============================================================================
 
+# This is a standalone native-Zsh program. Reset options inherited through
+# .zshenv before enabling the small set of non-default semantics we rely on.
+emulate -R zsh
 setopt EXTENDED_GLOB NO_NOMATCH NO_MONITOR NO_NOTIFY NO_CHECK_JOBS NO_HUP 2>/dev/null
 
 typeset -gr ZCHAT_NAME="zchat.zsh"
-typeset -gr ZCHAT_VERSION="1.0.8"
+typeset -gr ZCHAT_VERSION="1.0.9"
 typeset -gr ZCHAT_DEFAULT_OLLAMA_HOST="localhost:11434"
 typeset -g ZCHAT_HOST_OVERRIDE=0
 typeset -g ZCHAT_MODEL_OVERRIDE=0
@@ -53,67 +56,107 @@ zchat_show_help() {
 while (( $# > 0 )); do
   case "$1" in
     --host|-h)
+      (( $# >= 2 )) || {
+        print -u2 -r -- "Error: $1 requires a value"
+        exit 2
+      }
       shift
       zchat_require api || exit 1
       if ! api_normalize_host "$1"; then
-        echo "Error: $API_HOST_ERROR" >&2
+        print -u2 -r -- "Error: $API_HOST_ERROR"
         exit 2
       fi
       OLLAMA_HOST="$REPLY"
       ZCHAT_HOST_OVERRIDE=1
       ;;
     --model|-m)
+      (( $# >= 2 )) || {
+        print -u2 -r -- "Error: $1 requires a value"
+        exit 2
+      }
       shift
+      [[ -n "$1" && "$1" != -* ]] || {
+        print -u2 -r -- "Error: --model requires a non-empty model name"
+        exit 2
+      }
       SESSION_MODEL="$1"
       ZCHAT_REQUESTED_MODEL="$1"
       ZCHAT_MODEL_OVERRIDE=1
       ;;
     --context-window)
+      (( $# >= 2 )) || {
+        print -u2 -r -- "Error: $1 requires a value"
+        exit 2
+      }
       shift
-      if [[ "$1" != auto && "$1" != <4096-> ]]; then
-        echo "Error: --context-window expects auto or an integer of at least 4096" >&2
+      if [[ "$1" != auto ]] && { [[ "$1" != <4096-> ]] || (( ${#1} > 7 )) || (( 10#$1 > 1048576 )); }; then
+        print -u2 -r -- "Error: --context-window expects auto or an integer from 4096 through 1048576"
         exit 2
       fi
       ZCHAT_CONTEXT_WINDOW="$1"
       ;;
     --compact-at)
+      (( $# >= 2 )) || {
+        print -u2 -r -- "Error: $1 requires a value"
+        exit 2
+      }
       shift
       if [[ "$1" != <25-90> ]]; then
-        echo "Error: --compact-at expects an integer from 25 through 90" >&2
+        print -u2 -r -- "Error: --compact-at expects an integer from 25 through 90"
         exit 2
       fi
       ZCHAT_COMPACT_PERCENT="$1"
       ;;
     --help)
-      echo "Usage: ${ZCHAT_NAME} [options]"
-      echo "Options:"
-      echo "  --host, -h <URL>         Ollama server (default: ${ZCHAT_DEFAULT_OLLAMA_HOST})"
-      echo "  --model, -m <model>      Default model name"
-      echo "  --context-window <N>     Context tokens to request, or auto"
-      echo "  --compact-at <percent>   Compact at 25-90% (default: 85)"
-      echo "  --version, -V            Show version"
-      echo "  --help                   Show this help"
+      print -r -- "Usage: ${ZCHAT_NAME} [options]"
+      print -r -- "Options:"
+      print -r -- "  --host, -h <URL>         Ollama server (default: ${ZCHAT_DEFAULT_OLLAMA_HOST})"
+      print -r -- "  --model, -m <model>      Default model name"
+      print -r -- "  --context-window <N>     Context tokens to request, or auto"
+      print -r -- "  --compact-at <percent>   Compact at 25-90% (default: 85)"
+      print -r -- "  --version, -V            Show version"
+      print -r -- "  --help                   Show this help"
       exit 0
       ;;
     --version|-V)
-      echo "${ZCHAT_NAME} v${ZCHAT_VERSION}"
+      print -r -- "${ZCHAT_NAME} v${ZCHAT_VERSION}"
       exit 0
       ;;
+    --)
+      shift
+      (( $# == 0 )) || {
+        print -u2 -r -- "Error: unexpected argument: $1"
+        exit 2
+      }
+      break
+      ;;
     *)
+      print -u2 -r -- "Error: unknown option or argument: $1"
+      exit 2
       ;;
   esac
   shift
 done
 
-zmodload zsh/curses zsh/datetime zsh/files zsh/mapfile zsh/net/tcp \
+zmodload zsh/curses zsh/datetime zsh/files zsh/net/tcp \
   zsh/system zsh/terminfo zsh/zselect || {
-  echo "Error: required Zsh loadable modules are unavailable." >&2
+  print -u2 -r -- "Error: required Zsh loadable modules are unavailable."
   exit 1
 }
 
 # Compaction owns state persisted by state.zsh, so it is part of the core load
 # rather than a late feature module. Modals are the only mode-gated library.
 zchat_require util json api compact state render input ui || exit 1
+
+# Environment-provided OLLAMA_HOST must cross the same validation boundary as
+# CLI and persisted values before it can become an HTTP Host header.
+if (( ZCHAT_HOST_OVERRIDE )); then
+  if ! api_normalize_host "$OLLAMA_HOST"; then
+    print -u2 -r -- "Error: $API_HOST_ERROR"
+    exit 2
+  fi
+  OLLAMA_HOST="$REPLY"
+fi
 
 # Runtime state
 typeset -g RUNNING=1
@@ -129,16 +172,30 @@ typeset -gF STREAM_NEXT_RENDER=0.0
 typeset -grF STREAM_RENDER_INTERVAL=0.08
 typeset -ga SPINNER_CHARS=('⠋' '⠙' '⠹' '⠸' '⠼' '⠴' '⠦' '⠧' '⠇' '⠏')
 typeset -g SPINNER_IDX=1
+typeset -gi CLEANUP_DONE=0
 
 # Clean exit handler
 cleanup() {
+  (( CLEANUP_DONE )) && return 0
+  CLEANUP_DONE=1
   RUNNING=0
   api_stop_stream "$STREAM_PID"
   [[ -n "$API_ASYNC_PID" ]] && api_async_cancel
   api_runtime_cleanup
   ui_end
 }
-trap cleanup EXIT INT TERM HUP
+
+zchat_signal_exit() {
+  local -i signal_status="$1"
+  cleanup
+  trap - EXIT
+  exit "$signal_status"
+}
+
+trap cleanup EXIT
+trap 'zchat_signal_exit 130' INT
+trap 'zchat_signal_exit 143' TERM
+trap 'zchat_signal_exit 129' HUP
 
 # Main Application Initialization
 main() {
@@ -148,7 +205,7 @@ main() {
   fi
   STREAM_BASE_FILE="${API_RUNTIME_DIR}/stream"
   if ! state_init; then
-    print -r -- "Error: could not initialize ${ZCHAT_CONFIG_DIR}" >&2
+    print -u2 -r -- "Error: ${STATE_ERROR:-could not initialize ${ZCHAT_CONFIG_DIR}}"
     return 1
   fi
   input_init
@@ -203,8 +260,11 @@ main() {
             output_tokens=0
           fi
           chat_record_response_usage "$STREAM_PAYLOAD" "$prompt_tokens" "$output_tokens"
-          state_set_last_assistant_message "$STREAM_LAST_CONTENT" "$STREAM_LAST_THINKING"
-          UI_STATUS_TEXT="Ready"
+          if state_set_last_assistant_message "$STREAM_LAST_CONTENT" "$STREAM_LAST_THINKING"; then
+            UI_STATUS_TEXT="Ready"
+          else
+            UI_STATUS_TEXT="Save error"
+          fi
         else
           if [[ "$CURRENT_SESSION_ID" == "$STREAM_SESSION_ID" ]]; then
             state_discard_streaming_message "$STREAM_MESSAGE_INDEX" || true
@@ -332,7 +392,11 @@ main() {
         UI_STATUS_TEXT="Wait for response"
         ui_draw_header
       else
-        state_new_session "$SESSION_MODEL" "$SESSION_SYSTEM_PROMPT"
+        if ! state_new_session "$SESSION_MODEL" "$SESSION_SYSTEM_PROMPT"; then
+          UI_STATUS_TEXT="Save error"
+          ui_draw_header
+          continue
+        fi
         CHAT_SCROLL_OFFSET=0
         CHAT_AUTO_SCROLL=1
         input_reset
@@ -474,8 +538,11 @@ main() {
               requested_model="${requested_model##[[:space:]]#}"
               if [[ -n "$requested_model" ]]; then
                 SESSION_MODEL="$requested_model"
-                state_save_session
-                state_append_message "system" "Model changed to ${SESSION_MODEL}."
+                if state_save_session; then
+                  state_append_message "system" "Model changed to ${SESSION_MODEL}." || true
+                else
+                  UI_STATUS_TEXT="Save error"
+                fi
               fi
               ui_refresh_all 0
               ;;
@@ -486,9 +553,12 @@ main() {
                 state_append_message "system" "Current Ollama URL: ${OLLAMA_HOST}"$'\n'"Change it with: /host http://hostname:11434"
               elif api_normalize_host "$requested_host"; then
                 OLLAMA_HOST="$REPLY"
-                _state_write_config
-                state_append_message "system" "Ollama URL changed to ${OLLAMA_HOST}."
-                UI_STATUS_TEXT="Ready"
+                if _state_write_config; then
+                  state_append_message "system" "Ollama URL changed to ${OLLAMA_HOST}." || true
+                  UI_STATUS_TEXT="Ready"
+                else
+                  UI_STATUS_TEXT="Save error"
+                fi
               else
                 state_append_message "system" "Could not change Ollama URL: ${API_HOST_ERROR}"
                 UI_STATUS_TEXT="Error"
@@ -508,7 +578,11 @@ main() {
               ui_refresh_all 0
               ;;
             /new|/clear)
-              state_new_session "$SESSION_MODEL" "$SESSION_SYSTEM_PROMPT"
+              if ! state_new_session "$SESSION_MODEL" "$SESSION_SYSTEM_PROMPT"; then
+                UI_STATUS_TEXT="Save error"
+                ui_refresh_all 0
+                continue
+              fi
               CHAT_SCROLL_OFFSET=0
               CHAT_AUTO_SCROLL=1
               ui_refresh_all 0
@@ -549,7 +623,12 @@ main() {
               ;;
             *)
               # 1. Append user prompt
-              state_append_message "user" "$prompt_text"
+              if ! state_append_message "user" "$prompt_text"; then
+                UI_STATUS_TEXT="Save error"
+                ui_refresh_all 0
+                ui_draw_input
+                continue
+              fi
 
               # 2. Compact when needed and build the bounded model payload.
               UI_STATUS_TEXT="Preparing"

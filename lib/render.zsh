@@ -14,8 +14,53 @@ typeset -gi RENDER_PREFIX_WIDTH=0
 typeset -gi RENDER_PREFIX_COUNT=-1
 typeset -g RENDER_PREFIX_SESSION=""
 
-typeset -g SPAN_SEP="~@~"
-typeset -g FIELD_SEP="~#~"
+typeset -ga RENDER_SPAN_ATTRS=()
+typeset -ga RENDER_SPAN_TEXTS=()
+
+# Span data is length-prefixed because rendered text is untrusted and can
+# contain any printable delimiter. Lengths count Zsh characters consistently
+# with the renderer's indexing and width calculations.
+_render_pack_span() {
+  local attr="$1" text="$2"
+  REPLY="${#attr}:${attr}${#text}:${text}"
+}
+
+render_unpack_spans() {
+  local data="$1" digits="" attr="" text=""
+  local -i length
+  RENDER_SPAN_ATTRS=()
+  RENDER_SPAN_TEXTS=()
+
+  while [[ -n "$data" ]]; do
+    [[ "$data" == <->:* ]] || return 1
+    digits="${data%%:*}"
+    (( ${#digits} <= 10 )) || return 1
+    data="${data[$(( ${#digits} + 2 )),-1]}"
+    length=$(( 10#$digits ))
+    (( ${#data} >= length )) || return 1
+    if (( length )); then
+      attr="${data[1,$length]}"
+      data="${data[$(( length + 1 )),-1]}"
+    else
+      attr=""
+    fi
+
+    [[ "$data" == <->:* ]] || return 1
+    digits="${data%%:*}"
+    (( ${#digits} <= 10 )) || return 1
+    data="${data[$(( ${#digits} + 2 )),-1]}"
+    length=$(( 10#$digits ))
+    (( ${#data} >= length )) || return 1
+    if (( length )); then
+      text="${data[1,$length]}"
+      data="${data[$(( length + 1 )),-1]}"
+    else
+      text=""
+    fi
+    RENDER_SPAN_ATTRS+=("$attr")
+    RENDER_SPAN_TEXTS+=("$text")
+  done
+}
 
 render_invalidate() {
   (( ++RENDER_REVISION ))
@@ -27,8 +72,7 @@ render_invalidate() {
 _render_tokenize_inline() {
   local line="$1"
   local def_attr="${2:-white/black}"
-  local -a spans=()
-  local rem="$line" m=""
+  local rem="$line" m="" encoded=""
   local -i cut
 
   while [[ -n "$rem" ]]; do
@@ -37,41 +81,48 @@ _render_tokenize_inline() {
     cut=${rem[(ib:1:)[\\\\\`\*\[~]]}
     if (( cut > 1 )); then
       if (( cut > ${#rem} )); then
-        spans+=("${def_attr}${FIELD_SEP}${rem}")
+        _render_pack_span "$def_attr" "$rem"
+        encoded+="$REPLY"
         break
       fi
-      spans+=("${def_attr}${FIELD_SEP}${rem[1,cut-1]}")
+      _render_pack_span "$def_attr" "${rem[1,cut-1]}"
+      encoded+="$REPLY"
       rem="${rem[cut,-1]}"
     fi
 
     # Inline code: `code`
     if [[ "$rem" =~ "^(\`[^\`]+\`)(.*)" ]]; then
       m="${match[1]}"
-      spans+=("bold yellow/black${FIELD_SEP}${m[2,-2]}")
+      _render_pack_span "bold yellow/black" "${m[2,-2]}"
+      encoded+="$REPLY"
       rem="${match[2]}"
 
     # Bold + Italic: ***text***
     elif [[ "$rem" =~ "^(\*\*\*[^\*]+\*\*\*)(.*)" ]]; then
       m="${match[1]}"
-      spans+=("bold cyan/black${FIELD_SEP}${m[4,-4]}")
+      _render_pack_span "bold cyan/black" "${m[4,-4]}"
+      encoded+="$REPLY"
       rem="${match[2]}"
 
     # Strikethrough: ~~text~~
     elif [[ "$rem" =~ "^(~~[^~]+~~)(.*)" ]]; then
       m="${match[1]}"
-      spans+=("dim white/black${FIELD_SEP}${m[3,-3]}")
+      _render_pack_span "dim white/black" "${m[3,-3]}"
+      encoded+="$REPLY"
       rem="${match[2]}"
 
     # Bold: **bold**
     elif [[ "$rem" =~ "^(\*\*[^\*]+\*\*)(.*)" ]]; then
       m="${match[1]}"
-      spans+=("bold white/black${FIELD_SEP}${m[3,-3]}")
+      _render_pack_span "bold white/black" "${m[3,-3]}"
+      encoded+="$REPLY"
       rem="${match[2]}"
 
     # Italic: *italic* (styled in dim white without underline lines)
     elif [[ "$rem" =~ "^(\*[^\*]+\*)(.*)" ]]; then
       m="${match[1]}"
-      spans+=("dim white/black${FIELD_SEP}${m[2,-2]}")
+      _render_pack_span "dim white/black" "${m[2,-2]}"
+      encoded+="$REPLY"
       rem="${match[2]}"
 
     # Markdown links: [Label](url)
@@ -79,18 +130,21 @@ _render_tokenize_inline() {
       m="${match[1]}"
       rem="${match[2]}"
       if [[ "$m" =~ "\[([^]]+)\]\(([^)]+)\)" ]]; then
-        spans+=("bold cyan/black${FIELD_SEP}${match[1]}")
-        spans+=("dim white/black${FIELD_SEP} (${match[2]})")
+        _render_pack_span "bold cyan/black" "${match[1]}"
+        encoded+="$REPLY"
+        _render_pack_span "dim white/black" " (${match[2]})"
+        encoded+="$REPLY"
       fi
 
     # A marker character that opens no inline construct is literal text.
     else
-      spans+=("${def_attr}${FIELD_SEP}${rem[1,1]}")
+      _render_pack_span "$def_attr" "${rem[1,1]}"
+      encoded+="$REPLY"
       rem="${rem[2,-1]}"
     fi
   done
 
-  REPLY="${(j.~@~.)spans}"
+  REPLY="$encoded"
 }
 
 # Helper to add a rendered line with optional spans
