@@ -1,4 +1,4 @@
-# ⚡ zchat.zsh v1.0.7 — Native ZSH & Curses AI Terminal Interface
+# ⚡ zchat.zsh v1.0.8 — Native ZSH & Curses AI Terminal Interface
 
 > A full-screen, split-pane Terminal User Interface (TUI) AI chat client written in **pure ZSH**, connecting directly to **Ollama's Chat API** through Zsh's native TCP module with live token streaming, collapsible reasoning, and rich Markdown rendering.
 
@@ -52,7 +52,7 @@ See [System Requirements & Prerequisites](#-system-requirements--prerequisites) 
 
 ```
 ┌───────────────────────────────────────────────────────────────────────────┐
-│ ⚡ zchat.zsh v1.0.7 │ Model: gemma4:12b (localhost:11434)     [ Ready ]   │
+│ ⚡ zchat.zsh v1.0.8 │ Model: gemma4:12b (localhost:11434)     [ Ready ]   │
 ├───────────────┬───────────────────────────────────────────────────────────┤
 │ Sessions (3)  │  Chat Transcript (4 msgs)                                 │
 │ ▶ Hello World │  🧑 You  11:00                                            │
@@ -131,6 +131,7 @@ brew install zsh
 * **Header Bar**: Displays active model, Ollama endpoint, and animated status badges (`[ Thinking ⠋ ]`, `[ Streaming ⠋ ]`, `[ Ready ]`).
 * **Sidebar Pane**: Lists saved chat sessions with the active conversation highlighted.
 * **Chat Viewport**: Scrollable message transcript with automatic viewport scrolling during generation.
+* **Stable Transcript Copy (`Ctrl+Y` / `/copy`)**: Temporarily leaves curses and prints the visible transcript as plain text for reliable native terminal selection and copying. Expanded reasoning is included; collapsed reasoning stays hidden.
 * **Incremental Rendering**: Finalized messages are cached while only newly appended stream bytes and the active response are processed; terminal windows refresh as one frame.
 * **Multiline Prompt Editor**: A one-to-four-row cursor-following viewport with soft wrapping, hard newlines via `Shift+Enter` or `Alt+Enter`, vertical cursor movement, draft-preserving prompt history, and safe bracketed multiline paste.
 * **Footer Bar**: Live keybinding shortcuts and status hints.
@@ -162,6 +163,7 @@ brew install zsh
 | **`Enter`** | **Send Message** | Submits the current input prompt to Ollama |
 | **`Shift + Enter`** / **`Alt + Enter`** | **Newline** | Inserts a newline without sending; Alt+Enter is the terminal-compatible fallback |
 | **`Ctrl + R`** (`^R`) | **Toggle Reasoning** | Expands or collapses the reasoning block of the current response |
+| **`Ctrl + Y`** (`^Y`) | **Copy Transcript** | Opens a stable plain-text view for native terminal selection and copying |
 | **`Ctrl + O`** (`^O`) | **Model Selector** | Opens interactive modal to select installed Ollama models |
 | **`Ctrl + N`** (`^N`) | **New Chat** | Starts a fresh chat session with the current model |
 | **`Ctrl + S`** (`^S`) | **System Prompts** | Opens system prompt persona preset selector |
@@ -185,6 +187,7 @@ You can type these directly into the prompt box and hit `Enter`:
 | Command | Action |
 | :--- | :--- |
 | `/reason` or `/think` | Toggle reasoning expand/collapse |
+| `/copy` | Open the plain-text transcript copy view |
 | `/model` | Open the model selector dialog |
 | `/model NAME` | Switch directly to an Ollama model |
 | `/host` | Show the current Ollama URL and change-command help |

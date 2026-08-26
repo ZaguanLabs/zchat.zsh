@@ -6,7 +6,7 @@
 setopt EXTENDED_GLOB NO_NOMATCH NO_MONITOR NO_NOTIFY NO_CHECK_JOBS NO_HUP 2>/dev/null
 
 typeset -gr ZCHAT_NAME="zchat.zsh"
-typeset -gr ZCHAT_VERSION="1.0.7"
+typeset -gr ZCHAT_VERSION="1.0.8"
 typeset -gr ZCHAT_DEFAULT_OLLAMA_HOST="localhost:11434"
 typeset -g ZCHAT_HOST_OVERRIDE=0
 typeset -g ZCHAT_MODEL_OVERRIDE=0
@@ -136,10 +136,7 @@ cleanup() {
   api_stop_stream "$STREAM_PID"
   [[ -n "$API_ASYNC_PID" ]] && api_async_cancel
   api_runtime_cleanup
-  ui_destroy_windows
-  zcurses end 2>/dev/null
-  print -rn -- $'\e[?2004l' > /dev/tty 2>/dev/null
-  print -rn -- "${terminfo[cnorm]}" 2>/dev/null
+  ui_end
 }
 trap cleanup EXIT INT TERM HUP
 
@@ -156,11 +153,10 @@ main() {
   fi
   input_init
 
-  zcurses init
-  # Delimit pasted text so embedded newlines remain inside one prompt.
-  print -rn -- $'\e[?2004h' > /dev/tty 2>/dev/null
-  ui_setup_windows
-  ui_refresh_all 0
+  ui_init 0 || {
+    print -r -- "Error: could not initialize curses UI" >&2
+    return 1
+  }
 
   # Pre-declare all function-scoped variables
   local ch="" key="" mouse=""
@@ -366,6 +362,14 @@ main() {
         ui_refresh_all 0
       fi
 
+    # Ctrl+Y (^Y = \x19): Stable plain-text transcript copy view
+    elif [[ "$cur_ch" == $'\x19' ]]; then
+      if [[ -n "$STREAM_PID" ]]; then
+        ui_copy_view 1 || break
+      else
+        ui_copy_view 0 || break
+      fi
+
     # Ctrl+H (^H = \x08 / \x7f with mod) or F1: Help modal
     elif [[ "$cur_ch" == $'\x08' || "$cur_key" == "F1" ]]; then
       zchat_show_help
@@ -494,6 +498,9 @@ main() {
             /reason*|/think*)
               state_toggle_last_reasoning
               ui_draw_chat 0
+              ;;
+            /copy)
+              ui_copy_view 0 || break
               ;;
             /sys*|/system*)
               zchat_select_system_prompt

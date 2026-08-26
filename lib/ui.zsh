@@ -10,6 +10,7 @@ typeset -g FOOT_H=1
 typeset -gr INPUT_MAX_ROWS=4
 typeset -gF UI_NEXT_RESIZE_CHECK=0.0
 typeset -grF UI_RESIZE_CHECK_INTERVAL=0.25
+typeset -gi UI_ACTIVE=0
 
 # Focus management: 'input', 'sidebar', 'chat'
 typeset -g FOCUS_PANE="input"
@@ -142,6 +143,80 @@ ui_destroy_windows() {
   zcurses delwin chat_win 2>/dev/null
   zcurses delwin input_win 2>/dev/null
   zcurses delwin foot_win 2>/dev/null
+}
+
+# Enter and leave curses through one lifecycle so temporary plain-text views
+# restore the same terminal modes as normal startup and shutdown.
+ui_init() {
+  local -i is_streaming="${1:-0}"
+  zcurses init || return 1
+  UI_ACTIVE=1
+  print -rn -- $'\e[?2004h' > /dev/tty 2>/dev/null
+  ui_setup_windows
+  ui_refresh_all "$is_streaming"
+}
+
+ui_end() {
+  (( UI_ACTIVE )) || return 0
+  UI_ACTIVE=0
+  ui_destroy_windows
+  zcurses end 2>/dev/null
+  print -rn -- $'\e[?2004l' > /dev/tty 2>/dev/null
+  print -rn -- "${terminfo[cnorm]}" 2>/dev/null
+}
+
+# Build the visible transcript as stable plain text. Expanded reasoning is
+# included and collapsed reasoning remains hidden, matching the curses view.
+ui_plain_transcript() {
+  local output="" label="" role="" content="" thinking="" time="" model=""
+  local -i i
+  for (( i=1; i<=${#MSG_ROLES}; i++ )); do
+    role="${MSG_ROLES[i]}"
+    content="${MSG_CONTENTS[i]}"
+    thinking="${MSG_THINKINGS[i]:-}"
+    time="${MSG_TIMES[i]:-}"
+    case "$role" in
+      user) label="You" ;;
+      assistant)
+        model="${MSG_MODELS[i]:-$SESSION_MODEL}"
+        label="Assistant (${model})"
+        ;;
+      system) label="System" ;;
+      error) label="Error" ;;
+      *) label="${role:u}" ;;
+    esac
+    [[ -n "$output" ]] && output+=$'\n'
+    output+="=== ${label}${time:+  ${time}} ==="$'\n'
+    if [[ -n "$thinking" ]] && (( ${MSG_THINKING_EXPANDED[i]:-0} )); then
+      output+=$'Reasoning:\n'"$thinking"$'\n\n'
+    fi
+    [[ -n "$content" ]] && output+="$content"$'\n'
+  done
+  [[ -n "$output" ]] || output="(No transcript events yet.)"$'\n'
+  REPLY="$output"
+}
+
+# Suspend curses so terminal mouse selection and native copy shortcuts work
+# normally, without introducing a platform-specific clipboard dependency.
+ui_copy_view() {
+  local -i is_streaming="${1:-0}"
+  local transcript="" ignored=""
+  (( UI_ACTIVE )) || return 1
+  ui_plain_transcript
+  transcript="$REPLY"
+  ui_end
+  {
+    print -rn -- $'\e[2J\e[H'
+    print -r -- "zchat.zsh transcript copy view"
+    print -r -- "Select text with the terminal mouse and use its normal copy shortcut. Scroll as needed."
+    print -r -- "Press Enter when finished to return to zchat."
+    print -r -- ""
+    print -r -- "$transcript"
+    print -r -- ""
+    print -rn -- "Press Enter to return: "
+  } > /dev/tty
+  IFS= read -r ignored < /dev/tty
+  ui_init "$is_streaming"
 }
 
 # Render the Top Header Bar
@@ -408,7 +483,7 @@ ui_input_changed() {
 # Render the Bottom Footer Bar
 ui_draw_footer() {
   local -i defer_refresh="${1:-0}"
-  local bar_str=" Enter Send  S/M-Enter Newline  ^O Model  ^R Reason  ^N New  PgUp/Dn Scroll  ^Q Quit" padded=""
+  local bar_str=" Enter Send  S/M-Enter Newline  ^O Model  ^R Reason  ^Y Copy  ^N New  PgUp/Dn Scroll  ^Q Quit" padded=""
   zcurses clear foot_win
   zcurses attr foot_win reverse dim white/black
   zchat_pad_right "$bar_str" "$SCREEN_W"

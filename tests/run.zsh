@@ -488,6 +488,21 @@ typeset render_calls="${(j:\n:)MOCK_ZCURSES_CALLS}"
 assert_contains "$render_calls" "2-5/5" "prompt title reports the cursor-following viewport"
 assert_contains "$render_calls" "string input_win ↑ " "prompt viewport marks rows above the visible range"
 
+MSG_ROLES=(user assistant assistant system)
+MSG_CONTENTS=("Copy this request" "Work completed" "" "Saved locally")
+MSG_THINKINGS=("" "private reasoning" "expanded reasoning" "")
+MSG_THINKING_EXPANDED=(0 0 1 0)
+MSG_TIMES=("10:00" "10:01" "10:02" "10:03")
+MSG_MODELS=("" "answer-model" "reasoning-model" "")
+ui_plain_transcript
+assert_contains "$REPLY" "Copy this request" "copy view exports transcript content as plain text"
+assert_contains "$REPLY" "Assistant (answer-model)" "copy view uses the response's recorded model"
+assert_not_contains "$REPLY" "private reasoning" "copy view omits collapsed reasoning"
+assert_contains "$REPLY" "expanded reasoning" "copy view includes expanded reasoning"
+MSG_THINKING_EXPANDED[2]=1
+ui_plain_transcript
+assert_contains "$REPLY" "private reasoning" "copy view includes reasoning after expansion"
+
 MSG_ROLES=(assistant assistant)
 MSG_CONTENTS=("finished answer" "streaming one")
 MSG_THINKINGS=("" "")
