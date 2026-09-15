@@ -1,5 +1,10 @@
 # lib/ui.zsh - Curses Layout, Multi-Pane Window Management, and Rendering for zchat
 
+source "${${(%):-%x}:A:h}/drawing.zsh"
+source "${${(%):-%x}:A:h}/terminal.zsh"
+source "${${(%):-%x}:A:h}/ui_preferences.zsh"
+source "${${(%):-%x}:A:h}/commands.zsh"
+
 # Terminal Dimensions and Layout Metrics
 typeset -g SCREEN_H=24
 typeset -g SCREEN_W=80
@@ -10,7 +15,9 @@ typeset -g FOOT_H=1
 typeset -gr INPUT_MAX_ROWS=4
 typeset -gF UI_NEXT_RESIZE_CHECK=0.0
 typeset -grF UI_RESIZE_CHECK_INTERVAL=0.25
-typeset -gi UI_ACTIVE=0
+typeset -gi UI_ACTIVE=0 UI_NATIVE_GEOMETRY=0 UI_SMALL_SCREEN=0
+typeset -g UI_INPUT_WINDOW=input_win
+typeset -gi UI_SIDEBAR_HIDDEN=0 UI_SLASH_ROWS=0 UI_SLASH_SELECTED=1
 
 # Focus management: 'input', 'sidebar', 'chat'
 typeset -g FOCUS_PANE="input"
@@ -33,21 +40,32 @@ ui_calculate_input_height() {
   (( max_rows > available )) && max_rows=$available
   ui_input_width
   input_layout "$REPLY" "$max_rows"
-  INPUT_H=$(( INPUT_VISIBLE_ROWS + 2 ))
+  ui_slash_update
+  INPUT_H=$(( INPUT_VISIBLE_ROWS + 2 + UI_SLASH_ROWS ))
 }
 
 # Query terminal geometry and allocate curses windows
 ui_setup_windows() {
   ui_destroy_windows
 
-  # Get physical screen dimensions from stdscr (pos: beg_y beg_x cur_y cur_x max_y max_x)
+  # Get dimensions from stdscr (pos: cur_y cur_x beg_y beg_x max_y max_x)
   local -a scr_pos=()
-  zcurses position stdscr scr_pos 2>/dev/null
+  zchat_draw position stdscr scr_pos 2>/dev/null
   SCREEN_H=${scr_pos[5]:-${LINES:-24}}
   SCREEN_W=${scr_pos[6]:-${COLUMNS:-80}}
 
+  UI_SMALL_SCREEN=0
+  UI_INPUT_WINDOW=input_win
+  if (( SCREEN_H < 12 || SCREEN_W < 32 )); then
+    UI_SMALL_SCREEN=1
+    UI_INPUT_WINDOW=stdscr
+    SIDE_W=0
+    FOCUS_PANE=input
+    return 0
+  fi
+
   # Dynamic sidebar width
-  if (( SCREEN_W < 75 )); then
+  if (( UI_SIDEBAR_HIDDEN || SCREEN_W < 75 )); then
     SIDE_W=0
   elif (( SCREEN_W < 100 )); then
     SIDE_W=20
@@ -70,13 +88,18 @@ ui_setup_windows() {
   local foot_y=$(( SCREEN_H - FOOT_H ))
 
   # Create windows strictly within stdscr boundaries
-  zcurses addwin top_win $TOP_H $SCREEN_W 0 0 2>/dev/null
+  zchat_draw addwin top_win $TOP_H $SCREEN_W 0 0 2>/dev/null
   if (( SIDE_W > 0 )); then
-    zcurses addwin side_win $main_h $SIDE_W $TOP_H 0 2>/dev/null
+    zchat_draw addwin side_win $main_h $SIDE_W $TOP_H 0 2>/dev/null
   fi
-  zcurses addwin chat_win $main_h $chat_w $TOP_H $chat_x 2>/dev/null
-  zcurses addwin input_win $INPUT_H $SCREEN_W $input_y 0 2>/dev/null
-  zcurses addwin foot_win $FOOT_H $SCREEN_W $foot_y 0 2>/dev/null
+  zchat_draw addwin chat_win $main_h $chat_w $TOP_H $chat_x 2>/dev/null
+  zchat_draw addwin input_win $INPUT_H $SCREEN_W $input_y 0 2>/dev/null
+  zchat_draw addwin foot_win $FOOT_H $SCREEN_W $foot_y 0 2>/dev/null
+  local window
+  for window in top_win chat_win input_win foot_win; do ui_window_background "$window"; done
+  (( SIDE_W > 0 )) && ui_window_background side_win
+  (( SIDE_W == 0 )) && [[ "$FOCUS_PANE" == sidebar ]] && FOCUS_PANE=input
+  return 0
 }
 
 # Check the physical terminal dimensions without an external stty dependency.
@@ -85,14 +108,19 @@ ui_poll_resize() {
   (( now < UI_NEXT_RESIZE_CHECK )) && return 0
   UI_NEXT_RESIZE_CHECK=$(( now + UI_RESIZE_CHECK_INTERVAL ))
 
-  # Reloading terminfo makes setupterm query the current TTY dimensions. This
-  # is needed because non-interactive Zsh scripts do not update LINES/COLUMNS
-  # from WINCH while zsh/curses is active.
-  zmodload -u zsh/terminfo 2>/dev/null || return 0
-  zmodload zsh/terminfo 2>/dev/null || return 0
-
-  local new_h="${terminfo[lines]:-0}"
-  local new_w="${terminfo[cols]:-0}"
+  local new_h new_w
+  if (( UI_NATIVE_GEOMETRY )); then
+    local -a dimensions=()
+    zchat_draw geometry dimensions 2>/dev/null || return 0
+    (( ${#dimensions} == 2 )) || return 0
+    new_h=$dimensions[1]; new_w=$dimensions[2]
+  else
+    # Stock curses: refresh terminfo to query the TTY without a subprocess.
+    zmodload -u zsh/terminfo 2>/dev/null || return 0
+    zmodload zsh/terminfo 2>/dev/null || return 0
+    new_h=${terminfo[lines]:-0}; new_w=${terminfo[cols]:-0}
+  fi
+  [[ "$new_h" == <1-> && "$new_w" == <1-> ]] || return 0
   (( new_h > 0 && new_w > 0 )) || return 0
   (( new_h == SCREEN_H && new_w == SCREEN_W )) && return 0
 
@@ -106,7 +134,7 @@ ui_resize_windows() {
 
   # endwin makes ncurses re-enter the terminal with the new geometry. Keep the
   # existing windows intact if this curses build lacks resize_term support.
-  zcurses resize "$new_h" "$new_w" endwin 2>/dev/null || return 1
+  zchat_draw resize "$new_h" "$new_w" endwin 2>/dev/null || return 1
 
   ui_setup_windows
   ui_refresh_all 0
@@ -115,6 +143,7 @@ ui_resize_windows() {
 # Keep non-streaming Ollama metadata and checkpoint requests cancellable. Other
 # editing input waits for the request, while scrolling and resizing stay live.
 ui_wait_for_async_request() {
+  local -i TERMINAL_DISCARD_PASTE=1
   local label="${1:-Working}"
   local ch="" key="" mouse=""
   local previous_status="$UI_STATUS_TEXT"
@@ -123,8 +152,8 @@ ui_wait_for_async_request() {
   while ! api_async_ready; do
     ui_poll_resize
     ch=""; key=""; mouse=""
-    zcurses timeout input_win 50
-    zcurses input input_win ch key mouse
+    zchat_draw timeout "$UI_INPUT_WINDOW" 50
+    terminal_read_event "$UI_INPUT_WINDOW" ch key mouse
     if [[ "$ch" == $'\x1b' || "$ch" == $'\x03' ]]; then
       UI_STATUS_TEXT="$previous_status"
       ui_draw_header
@@ -150,20 +179,25 @@ ui_wait_for_compaction() {
 
 # Destroy all windows
 ui_destroy_windows() {
-  zcurses delwin top_win 2>/dev/null
-  zcurses delwin side_win 2>/dev/null
-  zcurses delwin chat_win 2>/dev/null
-  zcurses delwin input_win 2>/dev/null
-  zcurses delwin foot_win 2>/dev/null
+  zchat_draw delwin top_win 2>/dev/null
+  zchat_draw delwin side_win 2>/dev/null
+  zchat_draw delwin chat_win 2>/dev/null
+  zchat_draw delwin input_win 2>/dev/null
+  zchat_draw delwin foot_win 2>/dev/null
 }
 
 # Enter and leave curses through one lifecycle so temporary plain-text views
 # restore the same terminal modes as normal startup and shutdown.
 ui_init() {
   local -i is_streaming="${1:-0}"
-  zcurses init || return 1
+  zchat_draw init || return 1
+  ui_theme_init
+  UI_NATIVE_GEOMETRY=0
+  (( ${ZCHAT_DRAW_FEATURES[(Ie)geometry]} )) && UI_NATIVE_GEOMETRY=1
   UI_ACTIVE=1
-  print -rn -- $'\e[?2004h' > /dev/tty 2>/dev/null
+  ui_preferences_load
+  input_detect_boundaries
+  terminal_start
   ui_setup_windows
   ui_refresh_all "$is_streaming"
 }
@@ -171,9 +205,9 @@ ui_init() {
 ui_end() {
   (( UI_ACTIVE )) || return 0
   UI_ACTIVE=0
+  terminal_end
   ui_destroy_windows
-  zcurses end 2>/dev/null
-  print -rn -- $'\e[?2004l' > /dev/tty 2>/dev/null
+  zchat_draw end 2>/dev/null
   print -rn -- "${terminfo[cnorm]}" 2>/dev/null
 }
 
@@ -213,10 +247,19 @@ ui_plain_transcript() {
 ui_copy_view() {
   local -i is_streaming="${1:-0}"
   local transcript="" ignored=""
+  local -i suspend_status=0
   (( UI_ACTIVE )) || return 1
   ui_plain_transcript
   transcript="$REPLY"
-  ui_end
+  terminal_suspend
+  suspend_status=$?
+  if (( suspend_status == 2 )); then
+    ui_end
+  elif (( suspend_status != 0 )); then
+    UI_STATUS_TEXT='Finish pasting before opening the copy view'
+    ui_draw_header
+    return 0
+  fi
   {
     print -rn -- $'\e[2J\e[H'
     print -r -- "zchat.zsh transcript copy view"
@@ -228,54 +271,41 @@ ui_copy_view() {
     print -rn -- "Press Enter to return: "
   } > /dev/tty
   IFS= read -r ignored < /dev/tty
-  ui_init "$is_streaming"
+  if (( suspend_status == 0 )); then
+    terminal_resume || return 1
+    ui_setup_windows
+    ui_refresh_all "$is_streaming"
+  else
+    ui_init "$is_streaming"
+  fi
 }
 
 # Render the Top Header Bar
 ui_draw_header() {
+  (( UI_SMALL_SCREEN )) && return 0
   local -i defer_refresh="${1:-0}"
-  local stat_val="$UI_STATUS_TEXT"
-  local status_str="[ ${stat_val} ]"
-  local status_x=$(( SCREEN_W - ${#status_str} - 3 ))
+  local stat_val="$UI_STATUS_TEXT" badge identity badge_style=success/surface
+  zchat_terminal_safe "$stat_val"
+  zchat_clip "$REPLY" $(( SCREEN_W / 2 - 6 ))
+  badge="[ $REPLY ]"
+  local -i status_x=$(( SCREEN_W - ${(m)#badge} - 2 ))
+  identity="${ZCHAT_NAME} · ${SESSION_MODEL} (${OLLAMA_HOST})"
+  case "$stat_val" in
+    *Error*|*Stopped*) badge_style=error/surface ;;
+    *Thinking*|*Streaming*|*Generating*|*Compacting*) badge_style=accent/surface ;;
+  esac
+  zchat_draw clear top_win
+  ui_attr top_win -dim -bold border/surface
+  ui_border top_win
+  ui_draw_row top_win 1 2 $(( status_x - 3 )) 'text/surface' "$identity"
+  ui_draw_row top_win 1 "$status_x" $(( SCREEN_W - status_x - 1 )) "$badge_style" "$badge"
 
-  zcurses clear top_win
-  zcurses attr top_win bold cyan/black
-  zcurses border top_win
-  zcurses move top_win 1 2
-
-  zcurses attr top_win bold cyan/black
-  zchat_curses_string top_win "⚡ ${ZCHAT_NAME} v${ZCHAT_VERSION} "
-  zcurses attr top_win dim white/black
-  zchat_curses_string top_win "│ "
-
-  zcurses attr top_win bold white/black
-  zchat_curses_string top_win "Model: "
-  zcurses attr top_win bold yellow/black
-  zchat_curses_string top_win "${SESSION_MODEL}"
-
-  zcurses attr top_win dim white/black
-  zchat_curses_string top_win " (${OLLAMA_HOST})"
-
-  # Status badge on the right
-  if (( status_x > 50 )); then
-    zcurses move top_win 1 $status_x
-    if [[ "$stat_val" == *"Thinking"* ]]; then
-      zcurses attr top_win bold magenta/black
-    elif [[ "$stat_val" == *"Streaming"* || "$stat_val" == *"Generating"* ]]; then
-      zcurses attr top_win bold yellow/black
-    elif [[ "$stat_val" == *"Error"* || "$stat_val" == *"Stopped"* ]]; then
-      zcurses attr top_win bold red/black
-    else
-      zcurses attr top_win bold green/black
-    fi
-    zchat_curses_string top_win "$status_str"
-  fi
-
-  (( defer_refresh )) || zcurses refresh top_win
+  (( defer_refresh )) || terminal_refresh top_win
 }
 
 # Render the Sidebar
 ui_draw_sidebar() {
+  (( UI_SMALL_SCREEN )) && return 0
   (( SIDE_W <= 0 )) && return
   local -i defer_refresh="${1:-0}"
 
@@ -285,15 +315,15 @@ ui_draw_sidebar() {
   local row=1 i=1 is_curr=0
   local s_id="" s_title="" display_txt="" line_fmt=""
 
-  zcurses clear side_win
+  zchat_draw clear side_win
   if [[ "$FOCUS_PANE" == "sidebar" ]]; then
-    zcurses attr side_win bold yellow/black
+    ui_attr side_win -dim bold accent/surface
   else
-    zcurses attr side_win dim white/black
+    ui_attr side_win -dim -bold border/surface
   fi
-  zcurses border side_win
-  zcurses move side_win 0 2
-  zcurses attr side_win bold white/black
+  ui_border side_win
+  zchat_draw move side_win 0 2
+  ui_attr side_win bold white/black
   zchat_curses_string side_win " Sessions (${#SESSION_IDS}) "
 
   for (( i=1; i<=total && row<=inner_h; i++ )); do
@@ -302,16 +332,17 @@ ui_draw_sidebar() {
     is_curr=0
     [[ "$s_id" == "$CURRENT_SESSION_ID" ]] && is_curr=1
 
-    zcurses move side_win $row 1
-    display_txt="${s_title[1,$(( inner_w - 4 ))]}"
+    zchat_draw move side_win $row 1
+    zchat_terminal_safe "$s_title"
+    zchat_clip "$REPLY" $(( inner_w - 4 )); display_txt="$REPLY"
 
     if (( is_curr )); then
-      zcurses attr side_win bold green/black
+      ui_attr side_win bold green/black
       zchat_pad_right "$display_txt" $(( inner_w - 4 ))
       line_fmt=" ▶ $REPLY"
       zchat_curses_string side_win "$line_fmt"
     else
-      zcurses attr side_win dim white/black
+      ui_attr side_win dim white/black
       zchat_pad_right "$display_txt" $(( inner_w - 4 ))
       line_fmt="   $REPLY"
       zchat_curses_string side_win "$line_fmt"
@@ -321,18 +352,19 @@ ui_draw_sidebar() {
 
   # Bottom helper info in sidebar
   if (( inner_h - row >= 3 )); then
-    zcurses move side_win $(( inner_h - 2 )) 1
-    zcurses attr side_win dim cyan/black
+    zchat_draw move side_win $(( inner_h - 2 )) 1
+    ui_attr side_win dim cyan/black
     zchat_curses_string side_win " ^N: New Chat"
-    zcurses move side_win $(( inner_h - 1 )) 1
+    zchat_draw move side_win $(( inner_h - 1 )) 1
     zchat_curses_string side_win " ^O: Models"
   fi
 
-  (( defer_refresh )) || zcurses refresh side_win
+  (( defer_refresh )) || terminal_refresh side_win
 }
 
 # Render the Chat Viewport
 ui_draw_chat() {
+  (( UI_SMALL_SCREEN )) && return 0
   local is_stream="${1:-0}"
   local -i defer_refresh="${2:-0}"
   local chat_inner_w=$(( SCREEN_W - SIDE_W - 2 ))
@@ -340,16 +372,16 @@ ui_draw_chat() {
 
   render_messages $chat_inner_w $is_stream
 
-  zcurses clear chat_win
+  zchat_draw clear chat_win
   if [[ "$FOCUS_PANE" == "chat" ]]; then
-    zcurses attr chat_win bold yellow/black
+    ui_attr chat_win -dim bold accent/surface
   else
-    zcurses attr chat_win dim white/black
+    ui_attr chat_win -dim -bold border/surface
   fi
-  zcurses border chat_win
+  ui_border chat_win
 
-  zcurses move chat_win 0 2
-  zcurses attr chat_win bold cyan/black
+  zchat_draw move chat_win 0 2
+  ui_attr chat_win bold cyan/black
   zchat_curses_string chat_win " Chat Transcript (${#MSG_ROLES} msgs) "
 
   local total_lines=${#RENDERED_LINES}
@@ -368,92 +400,63 @@ ui_draw_chat() {
     (( CHAT_SCROLL_OFFSET < 0 )) && CHAT_SCROLL_OFFSET=0
   fi
 
-  local row=1 idx=1 current_x=1 pad_len=0
-  local line_str="" attr_str="" span_str="" sp="" s_attr="" s_text=""
-  local visible_str="" padded="" padding=""
-  local -i span_index
-
+  local -i row idx span_index
+  local line_str attr_str span_str
+  local -a spans=()
   for (( row=1; row<=chat_inner_h; row++ )); do
     idx=$(( CHAT_SCROLL_OFFSET + row ))
-    if (( idx <= total_lines )); then
-      line_str="${RENDERED_LINES[idx]}"
-      attr_str="${RENDERED_ATTRS[idx]:-default/default}"
-      span_str="${RENDERED_SPANS[idx]:-}"
-
-      zcurses move chat_win $row 1
-      zcurses attr chat_win -bold -dim -underline -reverse -standout default/default
-
-      if [[ -n "$span_str" ]]; then
-        if ! render_unpack_spans "$span_str"; then
-          RENDER_SPAN_ATTRS=("$attr_str")
-          RENDER_SPAN_TEXTS=("$line_str")
-        fi
-        current_x=1
-        for (( span_index=1; span_index<=${#RENDER_SPAN_TEXTS}; span_index++ )); do
-          s_attr="${RENDER_SPAN_ATTRS[span_index]:-$attr_str}"
-          s_text="${RENDER_SPAN_TEXTS[span_index]:-}"
-          [[ -z "$s_text" ]] && continue
-          zcurses attr chat_win -bold -dim -underline -reverse -standout default/default
-          zcurses attr chat_win $=s_attr
-          zchat_curses_string chat_win "$s_text"
-          (( current_x += ${#s_text} ))
-          (( current_x > chat_inner_w )) && break
-        done
-        if (( current_x <= chat_inner_w )); then
-          pad_len=$(( chat_inner_w - current_x + 1 ))
-          zchat_repeat " " "$pad_len"
-          padding="$REPLY"
-          zcurses attr chat_win -bold -dim -underline -reverse -standout default/default
-          zcurses attr chat_win $=attr_str
-          zchat_curses_string chat_win "$padding"
-        fi
-      else
-        zcurses attr chat_win -bold -dim -underline -reverse -standout default/default
-        zcurses attr chat_win $=attr_str
-        visible_str="${line_str[1,$chat_inner_w]}"
-        zchat_pad_right "$visible_str" "$chat_inner_w"
-        padded="$REPLY"
-        zchat_curses_string chat_win "$padded"
-      fi
+    (( idx <= total_lines )) || break
+    line_str="${RENDERED_LINES[idx]}"
+    attr_str="${RENDERED_ATTRS[idx]:-default/default}"
+    span_str="${RENDERED_SPANS[idx]:-}"
+    spans=()
+    if [[ -n "$span_str" ]] && render_unpack_spans "$span_str"; then
+      for (( span_index=1; span_index<=${#RENDER_SPAN_TEXTS}; span_index++ )); do
+        spans+=("${RENDER_SPAN_ATTRS[span_index]:-$attr_str}" "${RENDER_SPAN_TEXTS[span_index]}")
+      done
+    else
+      spans=("$attr_str" "$line_str")
     fi
+    ui_draw_row chat_win "$row" 1 "$chat_inner_w" "${spans[@]}"
   done
 
   # Scroll indicator badge
   if (( total_lines > chat_inner_h && CHAT_SCROLL_OFFSET < total_lines - chat_inner_h )); then
-    zcurses move chat_win 0 $(( chat_inner_w - 18 ))
-    zcurses attr chat_win bold yellow/black
+    zchat_draw move chat_win 0 $(( chat_inner_w - 18 ))
+    ui_attr chat_win -dim bold accent/surface
     zchat_curses_string chat_win " [▼ Scroll: PgDn] "
   elif (( CHAT_SCROLL_OFFSET > 0 )); then
-    zcurses move chat_win 0 $(( chat_inner_w - 18 ))
-    zcurses attr chat_win dim white/black
+    zchat_draw move chat_win 0 $(( chat_inner_w - 18 ))
+    ui_attr chat_win dim white/black
     zchat_curses_string chat_win " [▲ Scrolled Up] "
   fi
 
-  (( defer_refresh )) || zcurses refresh chat_win
+  (( defer_refresh )) || terminal_refresh chat_win
 }
 
 # Render the multiline, cursor-following prompt editor.
 ui_draw_input() {
+  (( UI_SMALL_SCREEN )) && return 0
   local -i defer_refresh="${1:-0}"
-  local -i max_rows=$(( INPUT_H - 2 )) row visual_row cursor_y cursor_x total
-  local visible="" marker="" title=" Prompt (Enter sends · Shift-Enter newline) "
+  local -i max_rows=$(( INPUT_H - 2 - UI_SLASH_ROWS )) row visual_row cursor_y cursor_x total
+  local visible="" marker="" title=" Message "
 
   ui_input_width
   input_layout "$REPLY" "$max_rows"
   total=${#INPUT_VISUAL_LINES}
 
-  zcurses clear input_win
+  zchat_draw clear input_win
   if [[ "$FOCUS_PANE" == "input" ]]; then
-    zcurses attr input_win bold green/black
+    ui_attr input_win -dim bold accent/surface
   else
-    zcurses attr input_win dim white/black
+    ui_attr input_win -dim -bold border/surface
   fi
-  zcurses border input_win
+  ui_border input_win
 
-  zcurses move input_win 0 2
-  zcurses attr input_win bold white/black
+  zchat_draw move input_win 0 2
+  ui_attr input_win bold white/black
   if (( total > INPUT_VISIBLE_ROWS )); then
-    title=" Prompt (Enter sends · Shift-Enter newline · ${INPUT_VIEW_TOP}-$(( INPUT_VIEW_TOP + INPUT_VISIBLE_ROWS - 1 ))/${total}) "
+    title=" Message (${INPUT_VIEW_TOP}-$(( INPUT_VIEW_TOP + INPUT_VISIBLE_ROWS - 1 ))/${total}) "
   fi
   zchat_curses_string input_win "${title[1,$(( SCREEN_W - 4 ))]}"
 
@@ -464,12 +467,14 @@ ui_draw_input() {
     (( visual_row == 1 )) && marker="❯"
     (( row == 1 && INPUT_VIEW_TOP > 1 )) && marker="↑"
     (( row == INPUT_VISIBLE_ROWS && visual_row < total )) && marker="↓"
-    zcurses move input_win $row 2
-    zcurses attr input_win bold green/black
+    zchat_draw move input_win $row 2
+    ui_attr input_win -dim bold accent/surface
     zchat_curses_string input_win "$marker "
-    zcurses attr input_win white/black
+    ui_attr input_win white/black
     zchat_curses_string input_win "$visible"
   done
+
+  ui_slash_draw
 
   cursor_y=$(( INPUT_CURSOR_ROW - INPUT_VIEW_TOP + 1 ))
   cursor_x=$(( 4 + INPUT_CURSOR_COL ))
@@ -477,13 +482,14 @@ ui_draw_input() {
   (( cursor_y > INPUT_VISIBLE_ROWS )) && cursor_y=$INPUT_VISIBLE_ROWS
   (( cursor_x < 4 )) && cursor_x=4
   (( cursor_x > SCREEN_W - 2 )) && cursor_x=$(( SCREEN_W - 2 ))
-  zcurses move input_win $cursor_y $cursor_x
+  zchat_draw move input_win $cursor_y $cursor_x
 
-  (( defer_refresh )) || zcurses refresh input_win
+  (( defer_refresh )) || terminal_refresh input_win
 }
 
 # Grow the prompt upward only when it crosses a visual-row boundary.
 ui_input_changed() {
+  (( UI_SMALL_SCREEN )) && { ui_refresh_all; return 0; }
   local -i previous_height=$INPUT_H
   ui_calculate_input_height
   if (( INPUT_H != previous_height )); then
@@ -496,21 +502,35 @@ ui_input_changed() {
 
 # Render the Bottom Footer Bar
 ui_draw_footer() {
+  (( UI_SMALL_SCREEN )) && return 0
   local -i defer_refresh="${1:-0}"
-  local bar_str=" Enter Send  S/M-Enter Newline  ^O Model  ^R Reason  ^Y Copy  ^N New  PgUp/Dn Scroll  ^Q Quit" padded=""
-  zcurses clear foot_win
-  zcurses attr foot_win reverse dim white/black
+  local bar_str=" Enter Send   Alt+Enter Newline   ^O Model   ^N New   ^H Help   ^Q Quit" padded=""
+  zchat_draw clear foot_win
+  ui_attr foot_win -reverse -bold muted/surface
   zchat_pad_right "$bar_str" "$SCREEN_W"
   padded="$REPLY"
-  zcurses move foot_win 0 0
+  zchat_draw move foot_win 0 0
   zchat_curses_string foot_win "$padded"
-  zcurses attr foot_win -reverse default/default
-  (( defer_refresh )) || zcurses refresh foot_win
+  ui_attr foot_win -reverse default/default
+  (( defer_refresh )) || terminal_refresh foot_win
 }
 
 # Full UI refresh
 ui_refresh_all() {
-  local is_stream="${1:-0}"
+  if (( ! UI_SMALL_SCREEN )); then
+    local -i previous_height=$INPUT_H
+    ui_calculate_input_height
+    (( INPUT_H != previous_height )) && ui_setup_windows
+  fi
+  if (( UI_SMALL_SCREEN )); then
+    zchat_draw clear stdscr
+    ui_draw_row stdscr 0 0 $(( SCREEN_W - 1 )) 'text/surface' 'Enlarge terminal to 32 × 12'
+    (( SCREEN_H > 1 )) && ui_draw_row stdscr 1 0 $(( SCREEN_W - 1 )) 'muted/surface' 'Ctrl+Q quits'
+    terminal_refresh stdscr
+    return 0
+  fi
+  local is_stream="${1:-${STREAM_PID:+1}}"
+  is_stream=${is_stream:-0}
   local -a windows=(top_win)
   ui_draw_header 1
   if (( SIDE_W > 0 )); then
@@ -521,13 +541,23 @@ ui_refresh_all() {
   ui_draw_input 1
   ui_draw_footer 1
   windows+=(chat_win input_win foot_win)
-  zcurses refresh "${windows[@]}"
+  terminal_refresh "${windows[@]}"
 }
 
 # Streaming changes only the status badge and transcript. Avoid repainting the
 # sidebar, prompt, and footer for every visual frame.
 ui_refresh_stream() {
+  (( UI_SMALL_SCREEN )) && return 0
   ui_draw_header 1
   ui_draw_chat 1 1
-  zcurses refresh top_win chat_win
+  terminal_refresh top_win chat_win
+}
+
+ui_toggle_sidebar() {
+  emulate -L zsh
+  (( UI_ACTIVE )) || return 0
+  UI_SIDEBAR_HIDDEN=$(( ! UI_SIDEBAR_HIDDEN ))
+  ui_setup_windows
+  ui_preferences_save || UI_STATUS_TEXT='Could not save sidebar preference'
+  ui_refresh_all
 }

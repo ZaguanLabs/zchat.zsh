@@ -4,20 +4,21 @@
 _modal_frame() {
   local win="$1"
   local title="$2"
-  local border_color="${3:-cyan/black}"
 
-  zcurses clear "$win"
-  zcurses attr "$win" bold $=border_color
-  zcurses border "$win"
+  ui_window_background "$win"
+  zchat_draw clear "$win"
+  ui_attr "$win" -dim -bold border/surface
+  ui_border "$win"
 
-  zcurses move "$win" 0 2
-  zcurses attr "$win" bold white/black
+  zchat_draw move "$win" 0 2
+  ui_attr "$win" bold white/black
   zchat_curses_string "$win" " ${title} "
-  zcurses attr "$win" default/default
+  ui_attr "$win" default/default
 }
 
 # Modal 1: Select Ollama Model
 modal_select_model() {
+  (( UI_SMALL_SCREEN )) && return 0
   local -a models=()
   local -i request_status=1
   if api_async_start GET /api/tags "" "$OLLAMA_HOST"; then
@@ -49,13 +50,13 @@ modal_select_model() {
 
   local m_h=18
   local m_w=56
-  (( m_h > SCREEN_H - 4 )) && m_h=$(( SCREEN_H - 4 ))
+  (( m_h > SCREEN_H - 2 )) && m_h=$(( SCREEN_H - 2 ))
   (( m_w > SCREEN_W - 4 )) && m_w=$(( SCREEN_W - 4 ))
 
   local m_y=$(( (SCREEN_H - m_h) / 2 ))
   local m_x=$(( (SCREEN_W - m_w) / 2 ))
 
-  zcurses addwin modal_win $m_h $m_w $m_y $m_x 2>/dev/null || return
+  zchat_draw addwin modal_win $m_h $m_w $m_y $m_x 2>/dev/null || return
 
   local max_visible=$(( m_h - 4 ))
   local scroll_top=1
@@ -63,7 +64,7 @@ modal_select_model() {
   local ch="" key="" mouse="" cur_ch="" cur_key=""
 
   while true; do
-    _modal_frame modal_win "Select Ollama Model (↑/↓: Nav, Enter: Select, Esc: Cancel)" "cyan/black"
+    _modal_frame modal_win "Select Ollama Model (↑/↓: Nav, Enter: Select, Esc: Cancel)"
 
     # Adjust scrolling window
     if (( sel < scroll_top )); then
@@ -78,15 +79,15 @@ modal_select_model() {
       display_str="  ${mod_name}"
       [[ "$mod_name" == "$SESSION_MODEL" ]] && display_str="★ ${mod_name}"
 
-      zcurses move modal_win $row 2
+      zchat_draw move modal_win $row 2
       if (( i == sel )); then
-        zcurses attr modal_win reverse bold cyan/black
+        ui_attr modal_win reverse bold cyan/black
         zchat_pad_right "$display_str" $(( m_w - 4 ))
         padded="$REPLY"
         zchat_curses_string modal_win "$padded"
-        zcurses attr modal_win -reverse default/default
+        ui_attr modal_win -reverse default/default
       else
-        zcurses attr modal_win white/black
+        ui_attr modal_win white/black
         zchat_pad_right "$display_str" $(( m_w - 4 ))
         padded="$REPLY"
         zchat_curses_string modal_win "$padded"
@@ -95,17 +96,16 @@ modal_select_model() {
     done
 
     # Status count at bottom
-    zcurses move modal_win $(( m_h - 2 )) 2
-    zcurses attr modal_win dim white/black
+    zchat_draw move modal_win $(( m_h - 2 )) 2
+    ui_attr modal_win dim white/black
     zchat_curses_string modal_win "Model ${sel}/${total}  [Host: ${OLLAMA_HOST}]"
 
-    zcurses refresh modal_win
+    terminal_refresh modal_win
 
     ch=""
     key=""
     mouse=""
-    zcurses timeout modal_win -1
-    zcurses input modal_win ch key mouse
+    _modal_input
     cur_ch="$ch"
     cur_key="$key"
     ch="" key="" mouse=""
@@ -129,11 +129,12 @@ modal_select_model() {
     fi
   done
 
-  zcurses delwin modal_win 2>/dev/null
+  zchat_draw delwin modal_win 2>/dev/null
 }
 
 # Modal 2: Edit System Prompt
 modal_system_prompt() {
+  (( UI_SMALL_SCREEN )) && return 0
   local -a presets=(
     "Default: Helpful, knowledgeable, and concise AI assistant."
     "Coding: Expert software engineer providing minimal, correct code."
@@ -146,49 +147,48 @@ modal_system_prompt() {
   local total=${#presets}
   local m_h=14
   local m_w=68
-  (( m_h > SCREEN_H - 4 )) && m_h=$(( SCREEN_H - 4 ))
+  (( m_h > SCREEN_H - 2 )) && m_h=$(( SCREEN_H - 2 ))
   (( m_w > SCREEN_W - 4 )) && m_w=$(( SCREEN_W - 4 ))
 
   local m_y=$(( (SCREEN_H - m_h) / 2 ))
   local m_x=$(( (SCREEN_W - m_w) / 2 ))
 
-  zcurses addwin modal_win $m_h $m_w $m_y $m_x 2>/dev/null || return
+  zchat_draw addwin modal_win $m_h $m_w $m_y $m_x 2>/dev/null || return
 
   local ch="" key="" mouse="" cur_ch="" cur_key=""
   local row=2 i=1 p="" padded="" cur_preview=""
 
   while true; do
-    _modal_frame modal_win "System Prompt Presets (↑/↓: Nav, Enter: Set, Esc: Cancel)" "magenta/black"
+    _modal_frame modal_win "System Prompt Presets (↑/↓: Nav, Enter: Set, Esc: Cancel)"
 
     row=2
     for (( i=1; i<=total; i++ )); do
-      zcurses move modal_win $row 2
+      zchat_draw move modal_win $row 2
       p="${presets[i]}"
       zchat_pad_right "  $p" $(( m_w - 4 ))
       padded="$REPLY"
       if (( i == sel )); then
-        zcurses attr modal_win reverse bold magenta/black
+        ui_attr modal_win reverse bold magenta/black
         zchat_curses_string modal_win "$padded"
-        zcurses attr modal_win -reverse default/default
+        ui_attr modal_win -reverse default/default
       else
-        zcurses attr modal_win white/black
+        ui_attr modal_win white/black
         zchat_curses_string modal_win "$padded"
       fi
       (( row++ ))
     done
 
-    zcurses move modal_win $(( m_h - 3 )) 2
-    zcurses attr modal_win dim white/black
+    zchat_draw move modal_win $(( m_h - 3 )) 2
+    ui_attr modal_win dim white/black
     cur_preview="${SESSION_SYSTEM_PROMPT[1,$(( m_w - 14 ))]}"
     zchat_curses_string modal_win "Active: \"${cur_preview}...\""
 
-    zcurses refresh modal_win
+    terminal_refresh modal_win
 
     ch=""
     key=""
     mouse=""
-    zcurses timeout modal_win -1
-    zcurses input modal_win ch key mouse
+    _modal_input
     cur_ch="$ch"
     cur_key="$key"
     ch="" key="" mouse=""
@@ -212,22 +212,21 @@ modal_system_prompt() {
     fi
   done
 
-  zcurses delwin modal_win 2>/dev/null
+  zchat_draw delwin modal_win 2>/dev/null
 }
 
 # Modal 3: Help / Keybindings
 modal_show_help() {
-  local m_h=20
-  local m_w=62
-  (( m_h > SCREEN_H - 4 )) && m_h=$(( SCREEN_H - 4 ))
+  (( UI_SMALL_SCREEN )) && return 0
+  local m_h=24
+  local m_w=72
+  (( m_h > SCREEN_H - 2 )) && m_h=$(( SCREEN_H - 2 ))
   (( m_w > SCREEN_W - 4 )) && m_w=$(( SCREEN_W - 4 ))
 
   local m_y=$(( (SCREEN_H - m_h) / 2 ))
   local m_x=$(( (SCREEN_W - m_w) / 2 ))
 
-  zcurses addwin modal_win $m_h $m_w $m_y $m_x 2>/dev/null || return
-
-  _modal_frame modal_win "Keyboard Shortcuts & Help (Press any key to close)" "yellow/black"
+  zchat_draw addwin modal_win $m_h $m_w $m_y $m_x 2>/dev/null || return
 
   local -a help_items=(
     "Enter         : Send message"
@@ -240,7 +239,10 @@ modal_show_help() {
     "/compact/context: Checkpoint / show context budget"
     "Ctrl+S        : Change system prompt preset"
     "Ctrl+C        : Cancel active streaming / Clear input"
-    "Tab           : Switch focus between Chat and Sidebar"
+    "Ctrl+B /sidebar: Toggle sessions sidebar (saved)"
+    "Alt+1 / Alt+2 : Focus sessions / message input"
+    "/ then Tab    : Complete a slash command (Up/Down selects)"
+    "Tab           : Cycle input, sessions and chat focus"
     "PgUp / PgDn   : Scroll chat history"
     "Home / End    : Jump to start / end of chat"
     "Ctrl+U        : Clear input line"
@@ -249,21 +251,50 @@ modal_show_help() {
     "Ctrl+Q / ^D   : Quit zchat.zsh"
   )
 
-  local row=2
-  local item=""
-  for item in "${help_items[@]}"; do
-    zcurses move modal_win $row 2
-    zcurses attr modal_win white/black
-    zchat_curses_string modal_win "  $item"
-    (( row++ ))
-    (( row >= m_h - 1 )) && break
+  local -i row offset=0 capacity=$(( m_h - 3 )) index maximum
+  local item="" ch="" key="" mouse=""
+  maximum=$(( ${#help_items} - capacity ))
+  (( maximum < 0 )) && maximum=0
+  while true; do
+    _modal_frame modal_win "Help · ↑/↓ Scroll · Esc Close"
+    for (( row=0; row<capacity; row++ )); do
+      index=$(( offset + row + 1 ))
+      (( index <= ${#help_items} )) || break
+      ui_draw_row modal_win $(( row + 2 )) 2 $(( m_w - 4 )) text/surface "${help_items[index]}"
+    done
+    terminal_refresh modal_win
+    ch=''; key=''; mouse=''
+    _modal_input
+    case "$key" in
+      UP) (( offset-- )) ;;
+      DOWN) (( offset++ )) ;;
+      PPAGE) (( offset-=capacity )) ;;
+      NPAGE) (( offset+=capacity )) ;;
+      HOME) offset=0 ;;
+      END) offset=$maximum ;;
+      PASTE*) continue ;;
+      *) break ;;
+    esac
+    (( offset < 0 )) && offset=0
+    (( offset > maximum )) && offset=$maximum
   done
 
-  zcurses refresh modal_win
+  zchat_draw delwin modal_win 2>/dev/null
+}
 
-  local ch="" key="" mouse=""
-  zcurses timeout modal_win -1
-  zcurses input modal_win ch key mouse
-
-  zcurses delwin modal_win 2>/dev/null
+# Keep resize polling live while an overlay owns input. Close on resize so the
+# caller redraws a correctly sized chat; never retain an off-screen modal.
+_modal_input() {
+  local -i TERMINAL_DISCARD_PASTE=1
+  local -i previous_h=$SCREEN_H previous_w=$SCREEN_W
+  while true; do
+    zchat_draw timeout modal_win 50
+    terminal_read_event modal_win ch key mouse
+    ui_poll_resize
+    if (( SCREEN_H != previous_h || SCREEN_W != previous_w )); then
+      ch=$'\e'; key=''
+      return 0
+    fi
+    [[ -n "$ch$key" ]] && return 0
+  done
 }

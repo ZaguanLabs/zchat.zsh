@@ -10,7 +10,7 @@ typeset -g JSON_ERROR=""
 typeset -g JSON_MESSAGE_THINKING=""
 typeset -g JSON_MESSAGE_CONTENT=""
 typeset -g JSON_MESSAGE_ERROR=""
-typeset -gi JSON_MESSAGE_DONE=0
+typeset -gi JSON_MESSAGE_DONE=0 JSON_MESSAGE_DONE_PRESENT=0
 typeset -gi JSON_MESSAGE_PROMPT_TOKENS=0
 typeset -gi JSON_MESSAGE_OUTPUT_TOKENS=0
 
@@ -312,6 +312,7 @@ json_parse_ollama_event() {
   JSON_MESSAGE_CONTENT=""
   JSON_MESSAGE_ERROR=""
   JSON_MESSAGE_DONE=0
+  JSON_MESSAGE_DONE_PRESENT=0
   JSON_MESSAGE_PROMPT_TOKENS=0
   JSON_MESSAGE_OUTPUT_TOKENS=0
 
@@ -328,8 +329,8 @@ json_parse_ollama_event() {
 
     case "$key:$JSON_TOKEN_TYPE" in
       message:'{') _json_parse_message_object || return 1 ;;
-      done:true) JSON_MESSAGE_DONE=1; json_next || return 1 ;;
-      done:false) JSON_MESSAGE_DONE=0; json_next || return 1 ;;
+      done:true) JSON_MESSAGE_DONE_PRESENT=1; JSON_MESSAGE_DONE=1; json_next || return 1 ;;
+      done:false) JSON_MESSAGE_DONE_PRESENT=1; JSON_MESSAGE_DONE=0; json_next || return 1 ;;
       error:string) JSON_MESSAGE_ERROR="$JSON_TOKEN_VALUE"; json_next || return 1 ;;
       prompt_eval_count:number)
         _json_safe_uint "$JSON_TOKEN_VALUE" && JSON_MESSAGE_PROMPT_TOKENS="$REPLY"

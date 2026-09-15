@@ -194,7 +194,7 @@ _render_markdown_table() {
     for c in "${cells[@]}"; do
       c="${c##[[:space:]]#}"
       c="${c%%[[:space:]]#}"
-      w=${#c}
+      w=${(m)#c}
       if (( w > ${col_widths[c_idx]:-0} )); then
         col_widths[c_idx]=$w
       fi
@@ -272,10 +272,10 @@ _render_message_range() {
   local count=$range_end total_count=${#MSG_ROLES}
   if (( total_count == 0 && reset )); then
     _add_line " " "default/default" 0
-    _add_line "  👋 Welcome to ZSH AI Chat!" "bold cyan/black" 0
+    _add_line "  Welcome to zchat" "bold cyan/black" 0
     _add_line " " "default/default" 0
     _add_line "  • Type your message in the bottom input box and press Enter to send." "dim white/black" 0
-    _add_line "  • Press Ctrl+O to select another Ollama model (e.g. gemma4:12b, deepseek)." "dim white/black" 0
+    _add_line "  • Ctrl+O selects a model. Ctrl+H opens help." "dim white/black" 0
     _add_line "  • Press Ctrl+R to expand or collapse Reasoning blocks." "dim white/black" 0
     _add_line "  • Press Ctrl+N for new chat, Ctrl+S for system prompt presets." "dim white/black" 0
     _add_line "  • Press Tab to switch focus or PgUp/PgDn to scroll history." "dim white/black" 0
@@ -311,7 +311,7 @@ _render_message_range() {
     case "$role" in
       user)
         [[ -z "$content" ]] && continue
-        _add_line "🧑 You  ${tm}" "bold green/black" 0
+        _add_line "You  ${tm}" "bold green/black" 0
 
         raw_lines=("${(f)content}")
         for l in "${raw_lines[@]}"; do
@@ -329,7 +329,7 @@ _render_message_range() {
         ;;
 
       assistant)
-        _add_line "🤖 Assistant (${MSG_MODELS[i]:-$SESSION_MODEL})  ${tm}" "bold cyan/black" 0
+        _add_line "Assistant (${MSG_MODELS[i]:-$SESSION_MODEL})  ${tm}" "bold cyan/black" 0
 
         # ----------------------------------------------------------------------
         # 1. Reasoning Block (Collapsible)
@@ -424,7 +424,7 @@ _render_message_range() {
                 line_num=1
                 code_lang="${match[1]:-code}"
                 hdr="  ┌──   [${code_lang}] "
-                pad_len=$(( text_width - ${#hdr} ))
+                pad_len=$(( text_width - ${(m)#hdr} ))
                 (( pad_len < 2 )) && pad_len=2
                 zchat_repeat "─" "$pad_len"
                 bar="$REPLY"

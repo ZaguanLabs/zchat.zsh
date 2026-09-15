@@ -1,10 +1,16 @@
-.PHONY: check test compile clean
+.PHONY: check test compile clean zdraw curses
 
 check:
-	zsh -n zchat.zsh chat.sh lib/*.zsh tests/*.zsh
+	zsh -fc 'for f in zchat.zsh chat.sh lib/*.zsh scripts/*.zsh tests/*.zsh tests/fixtures/*.zsh(N); do zsh -n "$$f" || exit $$?; done'
+
+zdraw: check
+	zsh -df scripts/build-zdraw.zsh
+
+# Compatibility with the original build command.
+curses: zdraw
 
 test: check
-	zsh tests/run.zsh
+	zsh -df tests/run.zsh
 
 # Precompile libraries to Zsh wordcode (.zwc). `source` uses a current .zwc
 # automatically and ignores a stale one, so compilation is an optional startup

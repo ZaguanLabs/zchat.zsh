@@ -9,7 +9,7 @@ emulate -R zsh
 setopt EXTENDED_GLOB NO_NOMATCH NO_MONITOR NO_NOTIFY NO_CHECK_JOBS NO_HUP 2>/dev/null
 
 typeset -gr ZCHAT_NAME="zchat.zsh"
-typeset -gr ZCHAT_VERSION="1.0.9"
+typeset -gr ZCHAT_VERSION="1.0.11"
 typeset -gr ZCHAT_DEFAULT_OLLAMA_HOST="localhost:11434"
 typeset -g ZCHAT_HOST_OVERRIDE=0
 typeset -g ZCHAT_MODEL_OVERRIDE=0
@@ -138,7 +138,8 @@ while (( $# > 0 )); do
   shift
 done
 
-zmodload zsh/curses zsh/datetime zsh/files zsh/net/tcp \
+zchat_require draw || exit 1
+zchat_draw_load && zmodload zsh/datetime zsh/files zsh/net/tcp \
   zsh/system zsh/terminfo zsh/zselect || {
   print -u2 -r -- "Error: required Zsh loadable modules are unavailable."
   exit 1
@@ -313,8 +314,12 @@ main() {
     ch=""
     key=""
     mouse=""
-    zcurses timeout input_win 50
-    zcurses input input_win ch key mouse
+    zchat_draw timeout "$UI_INPUT_WINDOW" 50
+    TERMINAL_DISCARD_PASTE=0
+    [[ $FOCUS_PANE != input ]] && TERMINAL_DISCARD_PASTE=1
+    terminal_read_event "$UI_INPUT_WINDOW" ch key mouse
+
+    ui_slash_input "$ch" "$key" && continue
 
     # If timeout (no key pressed), continue loop
     if [[ -z "$ch" && -z "$key" ]]; then
@@ -335,8 +340,19 @@ main() {
 
     # Decode multiline input protocols before ordinary key dispatch. A paste
     # is inserted as one editor action and therefore can never submit itself.
-    if [[ "$FOCUS_PANE" == "input" ]] && input_decode_terminal_event "$cur_ch" "$cur_key"; then
-      if [[ "$INPUT_EVENT_ACTION" == "newline" ]]; then
+    if input_decode_terminal_event "$cur_ch" "$cur_key"; then
+      if [[ "$INPUT_EVENT_ACTION" == focus_sessions ]]; then
+        (( SIDE_W > 0 )) && FOCUS_PANE=sidebar
+        ui_refresh_all
+      elif [[ "$INPUT_EVENT_ACTION" == focus_prompt ]]; then
+        FOCUS_PANE=input
+        ui_refresh_all
+      elif [[ "$INPUT_EVENT_ACTION" == paste_rejected ]]; then
+        UI_STATUS_TEXT=$INPUT_EVENT_TEXT
+        ui_draw_header
+      elif [[ "$FOCUS_PANE" != input ]]; then
+        continue
+      elif [[ "$INPUT_EVENT_ACTION" == "newline" ]]; then
         input_insert $'\n'
         ui_input_changed
       elif [[ "$INPUT_EVENT_ACTION" == "paste" && -n "$INPUT_EVENT_TEXT" ]]; then
@@ -375,6 +391,10 @@ main() {
         input_clear
         ui_input_changed
       fi
+
+    # Ctrl+B: persistently show/hide the sessions sidebar.
+    elif [[ "$cur_ch" == $'\x02' ]]; then
+      ui_toggle_sidebar
 
     # Ctrl+R (^R = \x12): Toggle Reasoning block expansion
     elif [[ "$cur_ch" == $'\x12' ]]; then
@@ -565,14 +585,17 @@ main() {
               fi
               ui_refresh_all 0
               ;;
-            /reason*|/think*)
+            /reason|/think)
               state_toggle_last_reasoning
               ui_draw_chat 0
+              ;;
+            /sidebar)
+              ui_toggle_sidebar
               ;;
             /copy)
               ui_copy_view 0 || break
               ;;
-            /sys*|/system*)
+            /sys|/system)
               zchat_select_system_prompt
               ui_setup_windows
               ui_refresh_all 0

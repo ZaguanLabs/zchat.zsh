@@ -559,13 +559,13 @@ input_insert $'one\ntwo\nthree\nfour\nfive'
 ui_calculate_input_height
 assert_eq "6" "$INPUT_H" "prompt window grows to its four-row cap"
 
-typeset -ga MOCK_ZCURSES_CALLS=()
-zcurses() {
-  MOCK_ZCURSES_CALLS+=("${(j: :)@}")
+typeset -ga MOCK_DRAW_CALLS=()
+zchat_draw() {
+  MOCK_DRAW_CALLS+=("${(j: :)@}")
   return 0
 }
 ui_draw_input
-typeset render_calls="${(j:\n:)MOCK_ZCURSES_CALLS}"
+typeset render_calls="${(j:\n:)MOCK_DRAW_CALLS}"
 assert_contains "$render_calls" "2-5/5" "prompt title reports the cursor-following viewport"
 assert_contains "$render_calls" "string input_win ↑ " "prompt viewport marks rows above the visible range"
 
@@ -601,22 +601,31 @@ rendered_text="${(j:\n:)RENDERED_LINES}"
 assert_contains "$rendered_text" "streaming two" "stream render cache refreshes the active response"
 [[ "$rendered_text" != *"streaming one"* ]] && pass "stream render cache does not retain stale content" || fail "stream render cache does not retain stale content"
 
-MOCK_ZCURSES_CALLS=()
+MOCK_DRAW_CALLS=()
 SIDE_W=20
 ui_refresh_all 0
-render_calls="${(j:\n:)MOCK_ZCURSES_CALLS}"
+render_calls="${(j:\n:)MOCK_DRAW_CALLS}"
 assert_contains "$render_calls" "refresh top_win side_win chat_win input_win foot_win" "full refresh batches all curses windows"
 
-MOCK_ZCURSES_CALLS=()
+MOCK_DRAW_CALLS=()
 ui_refresh_stream
-render_calls="${(j:\n:)MOCK_ZCURSES_CALLS}"
+render_calls="${(j:\n:)MOCK_DRAW_CALLS}"
 assert_contains "$render_calls" "refresh top_win chat_win" "stream refresh repaints only changing windows"
 
 typeset hostile_option_version
 hostile_option_version="$(zsh -f -o KSH_ARRAYS "${PROJECT_DIR}/zchat.zsh" --version)"
-assert_eq "zchat.zsh v${ZCHAT_VERSION:-1.0.9}" "$hostile_option_version" "entrypoint resets hostile ambient Zsh options"
+assert_eq "zchat.zsh v${ZCHAT_VERSION:-1.0.11}" "$hostile_option_version" "entrypoint resets hostile ambient Zsh options"
 if zsh -f "${PROJECT_DIR}/zchat.zsh" --model >/dev/null 2>&1; then fail "CLI rejects missing option values"; else pass "CLI rejects missing option values"; fi
 if zsh -f "${PROJECT_DIR}/zchat.zsh" --unknown >/dev/null 2>&1; then fail "CLI rejects unknown options"; else pass "CLI rejects unknown options"; fi
+
+source "$TEST_DIR/chat_ports.zsh"
+source "$TEST_DIR/http_transport.zsh"
+
+unfunction zchat_draw
+source "$TEST_DIR/draw.zsh"
+source "$TEST_DIR/drawing.zsh"
+source "$TEST_DIR/input_cells.zsh"
+source "$TEST_DIR/chat_ports_pty.zsh"
 
 print -r -- "1..${TESTS}"
 (( FAILURES == 0 ))

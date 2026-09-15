@@ -1,6 +1,6 @@
 # lib/util.zsh - Native Zsh utility helpers
 
-typeset -ga ZCHAT_WRAPPED=()
+typeset -ga ZCHAT_WRAPPED=() ZCHAT_WRAPPED_LENGTHS=()
 
 # Make arbitrary text safe to hand to curses or a terminal. Raw conversation
 # text remains untouched everywhere else; only the display boundary replaces
@@ -37,7 +37,18 @@ zchat_terminal_safe() {
 zchat_curses_string() {
   local win="$1" value="$2"
   zchat_terminal_safe "$value" 0
-  zcurses string "$win" "$REPLY"
+  local value_safe="$REPLY"
+  local -a position=()
+  if zchat_draw position "$win" position 2>/dev/null && (( ${#position} == 6 )); then
+    # Leave the right border intact; the footer has no border.
+    local -i budget=$(( position[6] - position[2] - 1 ))
+    # position reports cursor y/x first, then window origin y/x and size.
+    [[ "$win" == foot_win ]] && (( budget++ ))
+    (( budget > 0 )) || return 0
+    zchat_clip "$value_safe" "$budget"
+    value_safe="$REPLY"
+  fi
+  zchat_draw string "$win" "$value_safe"
 }
 
 # Repeat a character without spawning printf in a command substitution.
@@ -50,51 +61,78 @@ zchat_repeat() {
   REPLY="${(pl:$count::$char:)empty}"
 }
 
-# Right-pad text to a fixed character width. Result is returned in REPLY.
-zchat_pad_right() {
-  local value="$1"
-  local width="${2:-0}"
-  REPLY="${(r:$width:)value}"
+# Clip to terminal cells without separating a base from its combining marks.
+# REPLY retains original text; callers which require padding add it separately.
+zchat_clip() {
+  local value="$1" ch=""
+  local -i width=${2:-0} cells=0 size=0
+  REPLY=""
+  (( width >= 0 )) || return 0
+  if [[ "$value" != *[^\ -~]* ]]; then REPLY="${value[1,width]}"; return 0; fi
+  if (( ${(m)#value} <= width )); then REPLY="$value"; return 0; fi
+  for ch in "${(@s::)value}"; do
+    size=${(m)#ch}
+    (( cells + size <= width )) || break
+    REPLY+="$ch"
+    (( cells += size ))
+  done
+  return 0
 }
 
-# Word-wrap one logical line using Zsh character indexing. Long words are
-# split at the requested width. Results are returned in ZCHAT_WRAPPED.
-zchat_wrap() {
-  local rest="$1"
-  local width="${2:-1}"
-  local probe="" line="" prefix=""
-  local cut=0
+# Shared hard/word wrapper. Output lengths count original characters, while
+# limits count display cells. Printable ASCII keeps the arithmetic fast path.
+# A glyph wider than the entire window is represented by '?' to make progress
+# without overflowing curses; its original character still counts as consumed.
+zchat_hard_wrap() { _zchat_wrap_cells "$1" "${2:-1}" 0; }
+zchat_wrap() { _zchat_wrap_cells "$1" "${2:-1}" 1; }
 
-  ZCHAT_WRAPPED=()
+_zchat_wrap_cells() {
+  local text="$1" probe="" prefix="" ch=""
+  local -i width=${2:-1} word_wrap=${3:-0} pos=1 total end cells size consumed ascii=0 cut
+  local -a chars=()
+  ZCHAT_WRAPPED=(); ZCHAT_WRAPPED_LENGTHS=()
   (( width < 1 )) && width=1
-
-  if [[ -z "$rest" ]]; then
-    ZCHAT_WRAPPED+=("")
-    return 0
-  fi
-
-  while (( ${#rest} > width )); do
-    probe="${rest[1,$width]}"
-    prefix="${probe%[[:space:]]*}"
-
-    if [[ "${rest[$(( width + 1 ))]}" == [[:space:]] ]]; then
-      line="$probe"
-      rest="${rest[$(( width + 2 )),-1]}"
-      rest="${rest##[[:space:]]#}"
-    elif [[ "$prefix" != "$probe" && -n "$prefix" ]]; then
-      cut=${#prefix}
-      line="${rest[1,$cut]}"
-      rest="${rest[$(( cut + 1 )),-1]}"
-      rest="${rest##[[:space:]]#}"
+  [[ -z "$text" ]] && { ZCHAT_WRAPPED=(""); ZCHAT_WRAPPED_LENGTHS=(0); return 0; }
+  [[ "$text" != *[^\ -~]* ]] && ascii=1
+  chars=("${(@s::)text}"); total=${#chars}
+  while (( pos <= total )); do
+    if (( ascii )); then
+      end=$(( pos + width )); (( end > total + 1 )) && end=$(( total + 1 ))
+      probe="${(j::)chars[pos,end-1]}"
     else
-      line="$probe"
-      rest="${rest[$(( width + 1 )),-1]}"
+      end=$pos; cells=0; probe=""
+      while (( end <= total )); do
+        ch="${chars[end]}"; size=${(m)#ch}
+        if (( cells + size > width )); then
+          if (( end == pos )); then probe='?'; (( end++ )); fi
+          break
+        fi
+        probe+="$ch"; (( cells += size, end++ ))
+      done
     fi
-
-    ZCHAT_WRAPPED+=("$line")
+    if (( word_wrap && end <= total )); then
+      prefix="${probe%[[:space:]]*}"
+      if [[ "${chars[end]}" == [[:space:]] ]]; then
+        while (( end <= total )) && [[ "${chars[end]}" == [[:space:]] ]]; do (( end++ )); done
+      elif [[ -n "$prefix" && "$prefix" != "$probe" ]]; then
+        cut=${#prefix}; probe="$prefix"; end=$(( pos + cut ))
+        while (( end <= total )) && [[ "${chars[end]}" == [[:space:]] ]]; do (( end++ )); done
+      fi
+    fi
+    consumed=$(( end - pos ))
+    ZCHAT_WRAPPED+=("$probe"); ZCHAT_WRAPPED_LENGTHS+=("$consumed")
+    pos=$end
   done
+  return 0
+}
 
-  ZCHAT_WRAPPED+=("$rest")
+zchat_pad_right() {
+  local value="$1"
+  local -i width=${2:-0} padding=0
+  zchat_clip "$value" "$width"
+  padding=$(( width - ${(m)#REPLY} ))
+  (( padding > 0 )) && REPLY+="${(pl:padding:: :)}"
+  return 0
 }
 
 # Query the caller's umask once per process. Every zchat writer restores the

@@ -30,6 +30,8 @@ typeset -gr API_MAX_STREAM_BYTES=134217728
 typeset -gr API_MAX_HTTP_CHUNK_BYTES=16777216
 typeset -gr API_MAX_NDJSON_EVENT_BYTES=8388608
 
+source "${${(%):-%x}:A:h}/http.zsh"
+
 # Create one private runtime directory for all request handoff files. Using an
 # atomically-created directory avoids predictable /tmp files and symlink races.
 api_runtime_init() {
@@ -140,31 +142,6 @@ _api_byte_length() {
   REPLY=${#1}
 }
 
-# Decode a complete HTTP/1.1 chunked body. Input indexing is deliberately byte
-# based because chunk sizes count octets, not Unicode characters.
-_api_dechunk() {
-  setopt localoptions extendedglob nomultibyte
-  local wire="$1" output="" size_line="" hex="" data=""
-  local -i size
-
-  while [[ -n "$wire" ]]; do
-    [[ "$wire" == *$'\r\n'* ]] || return 1
-    size_line="${wire%%$'\r\n'*}"
-    wire="${wire[$(( ${#size_line} + 3 )),-1]}"
-    hex="${size_line%%;*}"
-    [[ "$hex" == [[:xdigit:]]## ]] && (( ${#hex} <= 8 )) || return 1
-    size=$(( 16#$hex ))
-    (( size == 0 )) && break
-    (( ${#wire} >= size + 2 )) || return 1
-    [[ "${wire[$(( size + 1 )),$(( size + 2 ))]}" == $'\r\n' ]] || return 1
-    data="${wire[1,$size]}"
-    output+="$data"
-    wire="${wire[$(( size + 3 )),-1]}"
-  done
-
-  REPLY="$output"
-}
-
 # Perform a complete HTTP GET for Ollama model metadata.
 _api_http_get() {
   _api_http_request GET "$2" "" "$1" "$API_METADATA_TIMEOUT" "$API_MAX_METADATA_BYTES"
@@ -176,9 +153,8 @@ _api_http_request() {
   setopt localoptions nomultibyte
   local method="$1" path="$2" payload="${3:-}" endpoint="${4:-$OLLAMA_HOST}"
   local timeout="${5:-$API_CHAT_TIMEOUT}" max_body="${6:-$API_MAX_CHAT_BODY_BYTES}"
-  local fd="" request="" chunk="" raw="" header="" body=""
-  local status_line="" http_version="" http_code=""
-  local -i payload_bytes read_status raw_bytes
+  local fd="" request="" chunk=""
+  local -i payload_bytes read_status
 
   API_HTTP_BODY=""
   API_HTTP_ERROR=""
@@ -206,57 +182,24 @@ _api_http_request() {
     return 1
   fi
 
-  while true; do
-    sysread -i "$fd" -s 32768 -t "$timeout" chunk 2>/dev/null
-    read_status=$?
-    (( read_status == 0 )) || break
-    raw+="$chunk"
-    raw_bytes=${#raw}
-    if (( raw_bytes > max_body + API_MAX_HEADER_BYTES )); then
-      API_HTTP_ERROR="Ollama response exceeded the ${max_body}-byte limit"
-      ztcp -c "$fd" 2>/dev/null
-      return 1
-    fi
-    if [[ "$raw" != *$'\r\n\r\n'* ]] && (( raw_bytes > API_MAX_HEADER_BYTES )); then
-      API_HTTP_ERROR="Ollama HTTP headers exceeded the ${API_MAX_HEADER_BYTES}-byte limit"
-      ztcp -c "$fd" 2>/dev/null
-      return 1
-    fi
-  done
-  ztcp -c "$fd" 2>/dev/null
-  if (( read_status == 4 )); then
-    API_HTTP_ERROR="Ollama response timed out after ${timeout} seconds"
-    return 1
-  elif (( read_status != 5 )); then
-    API_HTTP_ERROR="Failed while reading the Ollama response"
-    return 1
-  fi
-
-  [[ "$raw" == *$'\r\n\r\n'* ]] || {
-    API_HTTP_ERROR="Ollama returned an incomplete HTTP response"
-    return 1
+  api_http_frame_reset "$max_body"
+  {
+    while [[ "$API_FRAME_STATE" != done ]]; do
+      chunk=""
+      sysread -i "$fd" -s 32768 -t "$timeout" chunk 2>/dev/null
+      read_status=$?
+      (( read_status == 5 )) && break
+      if (( read_status != 0 )); then
+        API_HTTP_ERROR="Failed reading Ollama response (status ${read_status}; timeout ${timeout}s)"
+        return 1
+      fi
+      api_http_frame_feed "$chunk" || return 1
+      API_HTTP_BODY+="$API_FRAME_OUTPUT"
+    done
+    api_http_frame_finish
+  } always {
+    ztcp -c "$fd" 2>/dev/null
   }
-  header="${raw%%$'\r\n\r\n'*}"
-  body="${raw[$(( ${#header} + 5 )),-1]}"
-  (( ${#body} <= max_body )) || {
-    API_HTTP_ERROR="Ollama response body exceeded the ${max_body}-byte limit"
-    return 1
-  }
-  status_line="${header%%$'\r\n'*}"
-  http_version="${status_line%% *}"
-  http_code="${${status_line#* }%% *}"
-  if [[ "$http_version" != HTTP/<->.<-> || "$http_code" != 2[0-9][0-9] ]]; then
-    API_HTTP_ERROR="Ollama HTTP error: ${status_line}"
-    API_HTTP_BODY="$body"
-    return 1
-  fi
-
-  if [[ "${(L)header}" == *$'transfer-encoding: chunked'* ]]; then
-    _api_dechunk "$body" || return 1
-    API_HTTP_BODY="$REPLY"
-  else
-    API_HTTP_BODY="$body"
-  fi
 }
 
 # Fetch model names from Ollama without curl or jq.
@@ -369,13 +312,21 @@ _api_process_event_line() {
   local line="$1" tfd="$2" cfd="$3" efd="$4" ufd="$5"
   local t="" c="" rest="" t_part="" c_part=""
 
-  [[ -z "$line" ]] && return 0
+  [[ -z "${line//[[:space:]]/}" ]] && return 0
+  if (( API_STREAM_SAW_DONE )); then
+    print -r -u "$efd" -- "Data after Ollama's final stream event"
+    return 1
+  fi
   if ! json_parse_ollama_event "$line"; then
     print -r -u "$efd" -- "Invalid Ollama JSON event: ${JSON_ERROR:-parse error}"
     return 1
   fi
   if [[ -n "$JSON_MESSAGE_ERROR" ]]; then
     print -r -u "$efd" -- "$JSON_MESSAGE_ERROR"
+    return 1
+  fi
+  if (( ! JSON_MESSAGE_DONE_PRESENT )); then
+    print -r -u "$efd" -- "Ollama stream event lacks a boolean done field"
     return 1
   fi
   if (( JSON_MESSAGE_DONE )); then
@@ -421,16 +372,21 @@ _api_consume_ndjson() {
   local data="$1" tfd="$2" cfd="$3" efd="$4" ufd="$5"
   local line=""
   API_NDJSON_BUFFER+="$data"
+  while [[ "$API_NDJSON_BUFFER" == *$'\n'* ]]; do
+    line="${API_NDJSON_BUFFER%%$'\n'*}"
+    API_NDJSON_BUFFER="${API_NDJSON_BUFFER[$(( ${#line} + 2 )),-1]}"
+    if (( ${#line} > API_MAX_NDJSON_EVENT_BYTES )); then
+      print -r -u "$efd" -- "Ollama NDJSON event exceeded the ${API_MAX_NDJSON_EVENT_BYTES}-byte limit"
+      return 1
+    fi
+    line="${line%$'\r'}"
+    _api_process_event_line "$line" "$tfd" "$cfd" "$efd" "$ufd" || return 1
+  done
   if (( ${#API_NDJSON_BUFFER} > API_MAX_NDJSON_EVENT_BYTES )); then
     print -r -u "$efd" -- "Ollama NDJSON event exceeded the ${API_MAX_NDJSON_EVENT_BYTES}-byte limit"
     return 1
   fi
-  while [[ "$API_NDJSON_BUFFER" == *$'\n'* ]]; do
-    line="${API_NDJSON_BUFFER%%$'\n'*}"
-    API_NDJSON_BUFFER="${API_NDJSON_BUFFER[$(( ${#line} + 2 )),-1]}"
-    line="${line%$'\r'}"
-    _api_process_event_line "$line" "$tfd" "$cfd" "$efd" "$ufd" || return 1
-  done
+  return 0
 }
 
 # Stream HTTP chunks directly into the reasoning/content descriptors. Transfer
@@ -439,9 +395,8 @@ _api_http_stream() {
   setopt localoptions extendedglob nomultibyte
   local endpoint="$1" payload="$2" t_file="$3" c_file="$4" err_file="$5" usage_file="$6"
   local fd="" tfd="" cfd="" efd="" ufd=""
-  local request="" chunk="" header="" status_line="" http_version="" http_code="" size_line="" hex="" data=""
-  local wire=""
-  local -i headers_done=0 chunked=0 expected=-1 payload_bytes total_bytes=0 read_status=0
+  local request="" chunk=""
+  local -i payload_bytes read_status=0
 
   API_NDJSON_BUFFER=""
   API_IN_THINK_TAG=0
@@ -469,98 +424,28 @@ _api_http_stream() {
     return 1
   fi
 
-  while true; do
+  api_http_frame_reset "$API_MAX_STREAM_BYTES"
+  while [[ "$API_FRAME_STATE" != done ]]; do
+    chunk=""
     sysread -i "$fd" -s 16384 -t "$API_CHAT_TIMEOUT" chunk 2>/dev/null
     read_status=$?
-    (( read_status == 0 )) || break
-    (( total_bytes += ${#chunk} ))
-    if (( total_bytes > API_MAX_STREAM_BYTES )); then
-      print -r -u "$efd" -- "Ollama stream exceeded the ${API_MAX_STREAM_BYTES}-byte limit"
-      ztcp -c "$fd" 2>/dev/null
+    (( read_status == 5 )) && break
+    if (( read_status != 0 )); then
+      print -r -u "$efd" -- "Failed reading Ollama stream (status ${read_status}; timeout ${API_CHAT_TIMEOUT}s)"
       return 1
     fi
-    wire+="$chunk"
-
-    if (( ! headers_done )); then
-      if [[ "$wire" != *$'\r\n\r\n'* ]] && (( ${#wire} > API_MAX_HEADER_BYTES )); then
-        print -r -u "$efd" -- "Ollama HTTP headers exceeded the ${API_MAX_HEADER_BYTES}-byte limit"
-        ztcp -c "$fd" 2>/dev/null
-        return 1
-      fi
-      [[ "$wire" == *$'\r\n\r\n'* ]] || continue
-      header="${wire%%$'\r\n\r\n'*}"
-      wire="${wire[$(( ${#header} + 5 )),-1]}"
-      status_line="${header%%$'\r\n'*}"
-      http_version="${status_line%% *}"
-      http_code="${${status_line#* }%% *}"
-      if [[ "$http_version" != HTTP/<->.<-> || "$http_code" != 2[0-9][0-9] ]]; then
-        print -r -u "$efd" -- "Ollama HTTP error: $status_line"
-        ztcp -c "$fd" 2>/dev/null
-        return 1
-      fi
-      [[ "${(L)header}" == *$'transfer-encoding: chunked'* ]] && chunked=1
-      headers_done=1
+    if ! api_http_frame_feed "$chunk"; then
+      print -r -u "$efd" -- "$API_HTTP_ERROR"
+      return 1
     fi
-
-    if (( chunked )); then
-      while true; do
-        if (( expected < 0 )); then
-          [[ "$wire" == *$'\r\n'* ]] || break
-          size_line="${wire%%$'\r\n'*}"
-          wire="${wire[$(( ${#size_line} + 3 )),-1]}"
-          hex="${size_line%%;*}"
-          if [[ "$hex" != [[:xdigit:]]## ]] || (( ${#hex} > 8 )); then
-            print -r -u "$efd" -- "Invalid HTTP chunk size"
-            ztcp -c "$fd" 2>/dev/null
-            return 1
-          fi
-          expected=$(( 16#$hex ))
-          (( expected == 0 )) && break 2
-          if (( expected > API_MAX_HTTP_CHUNK_BYTES )); then
-            print -r -u "$efd" -- "Ollama HTTP chunk exceeded the ${API_MAX_HTTP_CHUNK_BYTES}-byte limit"
-            ztcp -c "$fd" 2>/dev/null
-            return 1
-          fi
-        fi
-
-        (( ${#wire} >= expected + 2 )) || break
-        if [[ "${wire[$(( expected + 1 )),$(( expected + 2 ))]}" != $'\r\n' ]]; then
-          print -r -u "$efd" -- "Invalid HTTP chunk terminator"
-          ztcp -c "$fd" 2>/dev/null
-          return 1
-        fi
-        data="${wire[1,$expected]}"
-        wire="${wire[$(( expected + 3 )),-1]}"
-        expected=-1
-        _api_consume_ndjson "$data" "$tfd" "$cfd" "$efd" "$ufd" || {
-          ztcp -c "$fd" 2>/dev/null
-          return 1
-        }
-        (( API_STREAM_SAW_DONE )) && break 2
-      done
-    else
-      data="$wire"
-      wire=""
-      _api_consume_ndjson "$data" "$tfd" "$cfd" "$efd" "$ufd" || {
-        ztcp -c "$fd" 2>/dev/null
-        return 1
-      }
-      (( API_STREAM_SAW_DONE )) && break
-    fi
+    _api_consume_ndjson "$API_FRAME_OUTPUT" "$tfd" "$cfd" "$efd" "$ufd" || return 1
   done
-  if (( ! API_STREAM_SAW_DONE && read_status == 4 )); then
-    print -r -u "$efd" -- "Ollama stream timed out after ${API_CHAT_TIMEOUT} seconds"
-    return 1
-  elif (( ! API_STREAM_SAW_DONE && read_status != 5 )); then
-    print -r -u "$efd" -- "Failed while reading the Ollama stream"
+  if ! api_http_frame_finish; then
+    print -r -u "$efd" -- "$API_HTTP_ERROR"
     return 1
   fi
   if [[ -n "$API_NDJSON_BUFFER" ]]; then
     _api_process_event_line "${API_NDJSON_BUFFER%$'\r'}" "$tfd" "$cfd" "$efd" "$ufd" || return 1
-  fi
-  if (( ! headers_done )); then
-    print -r -u "$efd" -- "Ollama returned an incomplete HTTP response"
-    return 1
   fi
   if (( ! API_STREAM_SAW_DONE )); then
     print -r -u "$efd" -- "Ollama closed the response before its final event"

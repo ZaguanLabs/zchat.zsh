@@ -1,4 +1,4 @@
-# ⚡ zchat.zsh v1.0.9 — Native ZSH & Curses AI Terminal Interface
+# ⚡ zchat.zsh v1.0.11 — Native ZSH & Curses AI Terminal Interface
 
 > A full-screen, split-pane Terminal User Interface (TUI) AI chat client written in **pure ZSH**, connecting directly to **Ollama's Chat API** through Zsh's native TCP module with live token streaming, collapsible reasoning, and rich Markdown rendering.
 
@@ -10,7 +10,7 @@ With [Ollama](https://ollama.com/) installed and running:
 
 ```bash
 ollama pull gemma4:12b
-git clone https://github.com/ZaguanLabs/zchat.zsh.git
+git clone --recurse-submodules https://github.com/ZaguanLabs/zchat.zsh.git
 cd zchat.zsh
 ./zchat.zsh
 ```
@@ -50,25 +50,23 @@ See [System Requirements & Prerequisites](#-system-requirements--prerequisites) 
 
 **`zchat.zsh`** explores what is possible when pushing modern ZSH to its limits. Instead of relying on frameworks, Electron, or external runtime utilities, `zchat.zsh` uses Zsh's loadable modules to provide the interface, networking, JSON processing, persistence, and rendering itself.
 
-```
-┌───────────────────────────────────────────────────────────────────────────┐
-│ ⚡ zchat.zsh v1.0.9 │ Model: gemma4:12b (localhost:11434)     [ Ready ]   │
-├───────────────┬───────────────────────────────────────────────────────────┤
-│ Sessions (3)  │  Chat Transcript (4 msgs)                                 │
-│ ▶ Hello World │  🧑 You  11:00                                            │
-│   Python Math │    What is Rayleigh scattering?                           │
-│   Refactor    │                                                           │
-│               │  🤖 Assistant (gemma4:12b)  11:00                         │
-│               │    ▶ 💭 Reasoning (18 lines) [Press ^R to expand]         │
-│               │                                                           │
-│               │    Rayleigh scattering refers to the scattering of light  │
-│               │    by particles much smaller than the wavelength of...    │
-├───────────────┴───────────────────────────────────────────────────────────┤
-│ Prompt (Enter to Send, Ctrl+C to cancel)                                  │
-│ ❯ Explain it like I'm 5                                                   │
-├───────────────────────────────────────────────────────────────────────────┤
-│ [Enter] Send  [^O] Model  [^R] Reason  [^N] New  [^S] System  [^Q] Quit   │
-└───────────────────────────────────────────────────────────────────────────┘
+```text
+╭──────────────────────────────────────────────────────────────────────╮
+│ zchat.zsh · gemma4:12b (localhost:11434)                    [ Ready ] │
+╰──────────────────────────────────────────────────────────────────────╯
+╭─ Sessions (2) ───╮╭─ Chat Transcript (2 msgs) ───────────────────────╮
+│ ▶ Sunset colors ││ You  18:42                                       │
+│   Weekend plans ││   Why does the sky turn pink at sunset?          │
+│                 ││                                                 │
+│                 ││ Assistant (gemma4:12b)  18:42                     │
+│                 ││   Sunlight travels through more air at sunset.  │
+│                 ││   Blue light scatters away, leaving warmer       │
+│                 ││   colors.                                       │
+╰─────────────────╯╰─────────────────────────────────────────────────╯
+╭─ Message ───────────────────────────────────────────────────────────╮
+│ ❯ Does the same thing happen at sunrise?                            │
+╰─────────────────────────────────────────────────────────────────────╯
+ Enter Send   Alt+Enter Newline   ^O Model   ^N New   ^H Help   ^Q Quit
 ```
 
 ---
@@ -84,6 +82,71 @@ To run `zchat.zsh`, your system requires:
 | **`Ollama`** | Running instance | AI model inference backend (local LAN or localhost) | `curl http://localhost:11434/api/tags` |
 
 `curl` in the Ollama verification example is optional. The application itself does not invoke curl, jq, Python, fold, coreutils, or any other external runtime utility.
+
+### Calmer interface and the vendored module
+
+The interface uses a muted charcoal-and-sage palette: warm grey text, soft green
+focus accents, moss-grey borders and dusty rose errors. It keeps the calm feel
+of zcoder while giving zchat its own identity. The vendored
+[`zdraw`](https://github.com/ZaguanLabs/zdraw) module adds rounded borders, native
+terminal geometry queries and cell-clipped styled rows. RGB is used when the module and
+terminal description support direct colors; other terminals use a 256-color,
+basic or monochrome palette. The client remains focused on Ollama chat.
+
+The module is pinned as a Git submodule in `vendor/zdraw`. Build it once against
+a configured, built Zsh source tree matching the Zsh you use to launch zchat:
+
+```sh
+git submodule update --init --recursive
+ZSH_BUILD_ROOT=/path/to/matching/configured/zsh make zdraw
+./zchat.zsh
+```
+
+Build tools are needed only for this optional step: a C compiler, GNU Make,
+curses development headers, Autoconf/Autoheader, M4, Patch and standard Unix build
+utilities. See [the vendored build guide](vendor/zdraw/README.md#build-and-test)
+for public-source setup. The application integration requires a matching built
+shell; the module's standalone guide can also build an extracted release.
+
+Startup selects the locally built module only when its recorded Zsh version,
+patch level, platform and host match. It never builds at startup or changes the
+system module. An absent or incompatible local build falls back to stock curses;
+an already loaded module is retained. Rebuild after changing Zsh or hosts.
+The bundle loads as `zmodload zdraw`, with its own `zdraw` builtin and parameters;
+stock `zsh/curses` remains separate. The application selects one drawing backend
+for the entire terminal session.
+
+`make curses` and `ZCHAT_CURSES=stock` remain accepted for existing launchers;
+use `make zdraw` and `ZCHAT_DRAW` for new setups. If both environment variables
+are set, `ZCHAT_DRAW` takes precedence.
+
+| Environment variable | Default | Override |
+| :--- | :--- | :--- |
+| `ZCHAT_DRAW` | `auto` | `stock` uses the installed module |
+| `ZCHAT_COLOR` | `auto` | `basic` or `mono` selects a simpler palette |
+| `ZCHAT_BORDERS` | `auto` | `plain` uses standard curses borders |
+| `ZCHAT_SPANS` | `true` | `false` uses individual drawing calls |
+| `ZCHAT_SYNC_OUTPUT` | `auto` | `false` disables synchronized frames; `true` forces them |
+
+For example, `ZCHAT_DRAW=stock ./zchat.zsh` starts with stock curses. Both paths
+use native Zsh at runtime. Stock curses keeps the muted 256-color palette when
+available, with standard borders and a native terminfo resize fallback.
+
+### Native input and presentation
+
+The updated zdraw integration uses structured input events, bounded streaming
+paste, grapheme boundaries, synchronized presentation, and suspend/resume when
+available. Feature detection keeps stock curses and older modules usable.
+With the matching native module, cursor movement and deletion preserve whole
+accented letters, emoji modifiers, flags and joined emoji. Paste chunks are
+reassembled before CRLF normalization; tabs expand to spaces, terminal controls
+are removed, and pastes above 1 MiB are discarded in full. A paste started in a
+picker stays discarded even if resizing closes the picker.
+
+Stock curses retains its terminal's input processing, including CR translation
+and signal handling; native zdraw paste bypasses that processing. Synchronized
+output is enabled after a terminal capability reply, with balanced frame markers
+and cleanup. `/copy` uses native suspend/resume when available.
 
 ### Installing Missing Prerequisites
 
@@ -117,6 +180,7 @@ brew install zsh
 * **Immediate Feedback**: The moment you press Enter, a `▼ 💭 Thinking...` block appears in the chat transcript with an animated spinner in the header.
 * **Auto-Collapsing**: As soon as the main response starts arriving, the reasoning block collapses automatically into a compact single-line banner: `▶ 💭 Reasoning (N lines) [Press ^R to expand]`.
 * **Interactive Toggle (`Ctrl+R` / `/think`)**: Expand or collapse reasoning blocks anytime without disrupting your chat view.
+* **Incremental HTTP Framing**: Partial chunks display immediately. Content-Length and chunk boundaries are validated, and a final Ollama event cannot conceal truncated HTTP or trailing response data. Metadata requests finish at their declared body boundary.
 * **Fail-Closed Streaming**: Each response is bound to its originating session, malformed or incomplete streams surface an error, and cancelled requests leave no empty assistant placeholder.
 
 ### 2. Terminal Markdown & Syntax Engine
@@ -129,13 +193,15 @@ brew install zsh
 
 ### 3. Multi-Pane Responsive TUI
 * **Header Bar**: Displays active model, Ollama endpoint, and animated status badges (`[ Thinking ⠋ ]`, `[ Streaming ⠋ ]`, `[ Ready ]`).
+* **Sidebar Toggle (`Ctrl+B` / `/sidebar`)**: Hide the sessions pane for more reading space; the choice persists across launches. Narrow terminals still hide it automatically.
+* **Slash Suggestions**: Type `/` to discover chat commands. Use Up/Down to select, Tab or Enter to complete, then Enter to run. Escape closes suggestions.
 * **Sidebar Pane**: Lists saved chat sessions with the active conversation highlighted.
 * **Chat Viewport**: Scrollable message transcript with automatic viewport scrolling during generation.
 * **Stable Transcript Copy (`Ctrl+Y` / `/copy`)**: Temporarily leaves curses and prints the visible transcript as plain text for reliable native terminal selection and copying. Expanded reasoning is included; collapsed reasoning stays hidden.
 * **Incremental Rendering**: Finalized messages are cached while only newly appended stream bytes and the active response are processed; terminal windows refresh as one frame.
 * **Multiline Prompt Editor**: A one-to-four-row cursor-following viewport with soft wrapping, hard newlines via `Shift+Enter` or `Alt+Enter`, vertical cursor movement, draft-preserving prompt history, and safe bracketed multiline paste.
-* **Footer Bar**: Live keybinding shortcuts and status hints.
-* **Dynamic Sizing**: Automatically adapts to window resizing (`SIGWINCH`) and gracefully scales on smaller terminal dimensions.
+* **Footer Bar**: A quiet row of essential shortcuts; `Ctrl+H` opens the full reference.
+* **Dynamic Sizing**: Polls terminal geometry, hides the sidebar on narrow terminals, and shows a resize hint below 32 columns or 12 rows. Open pickers close on resize so their windows cannot remain off-screen.
 
 ### 4. Session Persistence & Sidebar History
 * All sessions are saved automatically in native directory-backed storage under `~/.config/zchat/sessions/`.
@@ -168,6 +234,8 @@ brew install zsh
 | **`Ctrl + N`** (`^N`) | **New Chat** | Starts a fresh chat session with the current model |
 | **`Ctrl + S`** (`^S`) | **System Prompts** | Opens system prompt persona preset selector |
 | **`Ctrl + C`** (`^C`) | **Cancel / Clear** | Cancels active generation or clears the input box |
+| **`Ctrl + B`** | **Toggle Sidebar** | Saves your preference for showing the sessions pane |
+| **`Alt + 1`** / **`Alt + 2`** | **Focus Pane** | Focuses visible sessions / message input |
 | **`Tab`** | **Cycle Focus** | Switches focus between Input $\rightarrow$ Sidebar $\rightarrow$ Chat |
 | **`PgUp` / `PgDn`** | **Scroll Chat** | Scrolls chat transcript history up or down |
 | **`Home` / `End`** | **Jump Chat** | Jumps directly to the start or end of the conversation |
@@ -188,6 +256,7 @@ You can type these directly into the prompt box and hit `Enter`:
 | :--- | :--- |
 | `/reason` or `/think` | Toggle reasoning expand/collapse |
 | `/copy` | Open the plain-text transcript copy view |
+| `/sidebar` | Toggle and remember sessions sidebar visibility |
 | `/model` | Open the model selector dialog |
 | `/model NAME` | Switch directly to an Ollama model |
 | `/host` | Show the current Ollama URL and change-command help |
@@ -204,20 +273,28 @@ You can type these directly into the prompt box and hit `Enter`:
 ## 🏛️ Project Architecture
 
 ```
-chat.sh/
+zchat.zsh/
 ├── zchat.zsh           # Main application entry point & curses event loop
 ├── chat.sh             # Portable launcher script
-├── Makefile            # Syntax checks, tests & optional wordcode compilation
+├── Makefile            # Checks, tests, optional module build & wordcode
+├── scripts/build-zdraw.zsh # Build and validate the local module
+├── vendor/zdraw/     # Pinned standalone module submodule
 ├── README.md           # Documentation & user guide
 └── lib/
-    ├── api.zsh         # Native TCP/HTTP Ollama client & stream splitter
+    ├── api.zsh         # Native TCP Ollama client & stream splitter
+    ├── http.zsh        # Incremental, bounded HTTP response framing
     ├── json.zsh        # Native JSON tokenizer, decoder & encoder
     ├── util.zsh        # Native wrapping, padding, time & file helpers
     ├── state.zsh       # Directory-backed session persistence & state
     ├── compact.zsh     # Context sizing, token estimates & checkpoints
     ├── render.zsh      # Markdown parser, table formatter & reasoning styling
-    ├── input.zsh       # Multiline editor, viewport, history & event decoder
-    ├── modal.zsh       # Overlay modals for models, system prompts & help
+    ├── input.zsh       # Cell-aware editor, viewport, history & paste decoder
+    ├── draw.zsh        # Compatible local module selection and stock fallback
+    ├── drawing.zsh     # Palette, rounded borders & bounded styled rows
+    ├── terminal.zsh    # Structured events, paste, synchronized frames & handoff
+    ├── commands.zsh    # Chat-only inline slash-command suggestions
+    ├── ui_preferences.zsh # Private, atomic sidebar preference storage
+    ├── modal.zsh       # Model/prompt pickers & scrollable keyboard help
     └── ui.zsh          # Multi-window curses layout, geometry & rendering
 ```
 
@@ -233,8 +310,15 @@ automatically uses a compiled file when it is current and ignores it when the
 matching `.zsh` source is newer, so compilation is optional and never required
 for correctness. Run `make clean` to remove generated wordcode.
 
+`make test` runs syntax checks, chat regressions, module selection tests and real
+PTY drawing/input/resize checks. The PTY checks need Zsh's `zpty` module and
+`stty` as test tools; neither is an application runtime dependency. They always
+exercise stock curses and also exercise the bundled module when a compatible
+local build is available. Tests also cover fragmented HTTP over real sockets,
+Unicode editing, synchronized frames, paste isolation and command completion.
+
 ### Event Loop Flow
-1. **Input Polling**: `zcurses input` polls non-blocking with a 50ms timeout. Native event decoding recognizes Shift/Alt+Enter and bracketed paste.
+1. **Input Polling**: Structured `zdraw event` (or stock `zcurses input`) polls with a 50ms timeout. One input owner decodes paste, capability replies and keys before editor or command dispatch.
 2. **Stream Processing**: A background Zsh worker uses `zsh/net/tcp`, `sysread`, and a native HTTP chunk decoder to consume Ollama's NDJSON stream in a private runtime directory, publishing an explicit completion status.
 3. **Incremental Frame Updates**: The event loop reads only newly appended reasoning/content bytes, reuses the rendered transcript prefix, and batches curses windows into one terminal refresh at a throttled frame rate.
 4. **Completion**: Only a valid stream ending in Ollama's final `done:true` event is persisted. Prompt usage calibrates future context estimates; failures and cancellation discard the in-memory placeholder.
@@ -269,6 +353,7 @@ All user configuration and conversation histories are stored following the XDG B
     "system_prompt": "You are a helpful, knowledgeable, and concise AI assistant."
   }
   ```
+* **UI Preferences**: `~/.config/zchat/ui-preferences` stores sidebar visibility as literal data, separately from conversations.
 * **Saved Sessions**: `~/.config/zchat/sessions/<timestamp>_<id>.session/`
 
 Session fields and message bodies are stored as raw files inside each session directory and accessed through `zsh/mapfile`; no serialization subprocess is needed. Files use mode `0600`, directories use `0700`, and metadata counts are written last as commit markers. Existing `.json` sessions are migrated automatically on startup, retained as backups, and secured on the next launch.
@@ -277,8 +362,8 @@ Session fields and message bodies are stored as raw files inside each session di
 
 ## ❓ Troubleshooting & FAQ
 
-### Q: Why do I see `zcurses module required`?
-**A:** Your ZSH installation does not have `zsh/curses` compiled in. On Debian/Ubuntu, ensure `zsh` and `zsh-common` are installed.
+### Q: Why are the drawing modules unavailable?
+**A:** Build the vendored `zdraw` module with `make zdraw`, or install Zsh with its stock `zsh/curses` module. On Debian/Ubuntu, ensure `zsh` and `zsh-common` are installed.
 
 ### Q: Can I use local models without LAN?
 **A:** Yes! Launch with `--host localhost:11434` or update `~/.config/zchat/config.json`.
