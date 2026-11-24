@@ -1,6 +1,6 @@
-# ⚡ zchat.zsh v1.0.11 — Native ZSH & Curses AI Terminal Interface
+# ⚡ zchat.zsh v1.0.12 — Native ZSH & Curses AI Terminal Interface
 
-> A full-screen, split-pane Terminal User Interface (TUI) AI chat client written in **pure ZSH**, connecting directly to **Ollama's Chat API** through Zsh's native TCP module with live token streaming, collapsible reasoning, and rich Markdown rendering.
+> A full-screen, split-pane Terminal User Interface (TUI) AI chat client written in **pure ZSH**, connecting directly to **Ollama's Chat API** through Zsh's native TCP module, with optional provider-agnostic remote APIs through [zcurl](https://github.com/ZaguanLabs/zcurl), live token streaming, collapsible reasoning, and rich Markdown rendering.
 
 ---
 
@@ -30,6 +30,7 @@ See [System Requirements & Prerequisites](#-system-requirements--prerequisites) 
 ## 📖 Table of Contents
 
 - [Quick Start](#-quick-start)
+- [Remote models through zcurl](#remote-models-through-zcurl)
 - [Overview](#-overview)
 - [System Requirements & Prerequisites](#-system-requirements--prerequisites)
 - [Key Features](#-key-features)
@@ -43,6 +44,132 @@ See [System Requirements & Prerequisites](#-system-requirements--prerequisites) 
 - [Project Architecture](#-project-architecture)
 - [Configuration & Data Storage](#-configuration--data-storage)
 - [Troubleshooting & FAQ](#-troubleshooting--faq)
+
+---
+
+## Remote models through zcurl
+
+Ollama continues to use the existing native TCP transport and needs no new
+module. Remote profiles use the optional [zcurl](https://github.com/ZaguanLabs/zcurl)
+Zsh module for HTTP/HTTPS, with certificate and hostname verification enabled.
+zcurl is pinned as a project-local submodule under `vendor/zcurl`. Build it from
+the zchat directory:
+
+```zsh
+git submodule update --init -- vendor/zcurl
+make zcurl
+export CHAT_API_KEY='your-api-key'
+```
+
+The default build currently targets **Zsh 5.9.2**. It downloads the pinned Zsh
+source archive over HTTPS, verifies its SHA-256 checksum, configures it, generates
+module headers, and builds `vendor/zcurl/build/zcurl.so`. It then verifies that
+the module loads in a fresh Zsh process. Sources and headers remain under
+`vendor/zcurl/.deps`; nothing is installed globally and your shell is not replaced.
+
+Build prerequisites are Zsh 5.9.2, a C compiler, make, pkg-config, libcurl
+development files **>= 8.16.0** with WebSocket support, plus curl, tar with xz
+support, sha256sum, and Zsh's configure dependencies. Remote support is not
+currently validated on Zsh 5.8. Ordinary Ollama use requires no zcurl build.
+
+To reuse a configured source tree with generated headers that matches your Zsh
+build, run `make zcurl ZSH_SRC=/absolute/path/to/zsh-source`. Matching the version
+alone does not guarantee ABI compatibility across distribution patches and build
+options; use matching sources when the default headers are unsuitable.
+
+Remote requests automatically load `vendor/zcurl/zcurl.zsh`; no environment
+override is required. You can still use a separately built module by setting
+`ZCHAT_ZCURL_LOADER=/absolute/path/to/zcurl/zcurl.zsh`. Build/download steps run
+only when explicitly requested, never during chat startup. Re-run `make zcurl`
+after updating the dependency or your Zsh installation. `make clean-zcurl`
+removes compiled zcurl modules while retaining downloaded sources and headers.
+
+Create `~/.config/zchat/remotes.json` (or
+`$XDG_CONFIG_HOME/zchat/remotes.json`). Start with
+[examples/remotes.json](examples/remotes.json), replacing the endpoint and model
+IDs with those supplied by your provider. Each entry is independently configured;
+there is no provider allowlist or automatic endpoint rewriting. Use the **full
+endpoint URL**, including its API path.
+
+A minimal profile:
+
+```json
+{
+  "models": {
+    "work": {
+      "protocol": "chat-completions",
+      "url": "https://your-provider.example/v1/chat/completions",
+      "model": "your-model-id",
+      "api_key_env": "CHAT_API_KEY"
+    }
+  }
+}
+```
+
+Select it with `./zchat.zsh --model remote:work`, `/model remote:work`, or the
+`Ctrl+O` model picker. Session persistence remembers the profile alias. Ordinary
+model names still select Ollama; `/host` still configures only Ollama. Set
+`ZCHAT_REMOTE_CONFIG` to an absolute filename to use another configuration file.
+Configuration is read at startup; restart after editing profiles.
+
+Profile names are your local display/selection aliases, separate from the
+provider's `model` ID. Start them with a letter or digit; subsequent characters
+may include letters, digits, dots, underscores, and hyphens. For example,
+`"glm-5.3-flash"` is selected with `/model remote:glm-5.3-flash`.
+
+| Profile field | Meaning |
+| --- | --- |
+| `protocol` | Required: `chat-completions`, `responses`, or `messages` |
+| `url`, `model` | Required: full HTTP(S) endpoint and provider model ID |
+| `auth` | `bearer` (default), `api-key` (`x-api-key`), or `none` |
+| `api_key_env` | Name of an **exported** environment variable containing the key; required unless `auth` is `none` |
+| `context_window` | Provider/model context capacity, 4096–1048576; defaults to 65536 |
+| `max_output_tokens` | Output allowance, less than context capacity; defaults to 4096 |
+| `token_field` | Chat Completions only: `max_tokens` (default) or `max_completion_tokens`, depending on the endpoint |
+| `headers` | Literal extra headers, such as `anthropic-version` or routing metadata |
+| `header_env` | Extra header names mapped to exported environment-variable names; useful for other authentication schemes with `auth: "none"` |
+| `ca_file` | Optional absolute path to a PEM CA trust file for private HTTPS endpoints; verification stays enabled |
+| `parameters` | Extra JSON request fields, such as `temperature`, `reasoning`, or `stream_options` |
+
+Set context and output limits to values your model actually supports. Remote
+profiles use these configured limits, independently of Ollama's context discovery
+and `--context-window`. Remote automatic and `/compact` checkpoints use the
+selected remote model. No remote request, including compaction, is sent to Ollama.
+
+Temperature is omitted unless configured in `parameters`, allowing models that
+reject that option. To request Chat Completions usage events, use
+`"parameters": {"stream_options": {"include_usage": true}}` if the endpoint
+supports it. Without usage, context accounting uses estimates. Messages providers
+may require a version header; configure that in `headers` as shown in the example.
+
+For Responses, `max_output_tokens` covers reasoning as well as visible text.
+If the server reports `response.incomplete` with reason `max_output_tokens`,
+increase the profile's output allowance or use a lower supported
+`parameters.reasoning.effort`. zchat reports provider error messages, codes, and
+parameter names for JSON HTTP errors and SSE errors. A successful Responses
+stream must contain `response.completed` with `response.status: "completed"`;
+an optional gateway `[DONE]` marker is accepted only after that event.
+Compressed HTTP streams are decoded by zcurl before SSE parsing.
+
+These adapters support text conversations, system instructions, streamed text,
+reasoning where supplied, token usage, cancellation, and protocol/API errors.
+They follow the [Chat Completions/Responses streaming formats](https://developers.openai.com/api/docs/guides/streaming-responses)
+and [Messages streaming format](https://platform.claude.com/docs/en/build-with-claude/streaming).
+Tools, multimodal inputs, and multiple simultaneous choices are not supported.
+Core request fields and token limits cannot be overridden through `parameters`.
+Credentials remain outside session files when referenced through environment
+variables. Only configure endpoints you intend to send the conversation to.
+
+zcurl is loaded inside a fresh Zsh worker because its handles cannot be inherited
+by forked workers. It streams into private handoff files while the interface
+remains responsive. The integration uses zcurl's concurrent HTTP and regular-file
+output APIs (tested with `0.27.0-dev`). zchat adds no Python, curl executable, or jq
+runtime dependency. Python is used only by the optional local integration tests:
+
+```zsh
+make test-remote  # Build local zcurl and run remote protocol/HTTP/HTTPS checks
+make test         # Full suite; includes integration checks when zcurl is built
+```
 
 ---
 
@@ -83,18 +210,19 @@ To run `zchat.zsh`, your system requires:
 
 `curl` in the Ollama verification example is optional. The application itself does not invoke curl, jq, Python, fold, coreutils, or any other external runtime utility.
 
-### Calmer interface and the vendored module
+### Terminal theme and zdraw
 
-The interface uses a muted charcoal-and-sage palette: warm grey text, soft green
-focus accents, moss-grey borders and dusty rose errors. It keeps the calm feel
-of zcoder while giving zchat its own identity. The vendored
-[`zdraw`](https://github.com/ZaguanLabs/zdraw) module adds rounded borders, native
-terminal geometry queries and cell-clipped styled rows. RGB is used when the module and
-terminal description support direct colors; other terminals use a 256-color,
-basic or monochrome palette. The client remains focused on Ollama chat.
+The interface uses deep teal surfaces, seafoam focus accents, and amber labels
+for your messages. The transcript has an open reading area with a capped line
+width. The composer, sessions rail, and shortcut bar adapt to the terminal size.
 
-The module is pinned as a Git submodule in `vendor/zdraw`. Build it once against
-a configured, built Zsh source tree matching the Zsh you use to launch zchat:
+The [`zdraw`](https://github.com/ZaguanLabs/zdraw) v0.1.4 submodule adds rounded
+borders, native terminal geometry, cell-clipped spans, and region fills for rules
+and selection highlights. The theme uses RGB where supported and also works in
+256-color, basic ANSI, and monochrome terminals.
+
+Build the module against a configured, built Zsh source tree matching the Zsh
+you use to launch zchat.
 
 ```sh
 git submodule update --init --recursive
@@ -104,9 +232,11 @@ ZSH_BUILD_ROOT=/path/to/matching/configured/zsh make zdraw
 
 Build tools are needed only for this optional step: a C compiler, GNU Make,
 curses development headers, Autoconf/Autoheader, M4, Patch and standard Unix build
-utilities. See [the vendored build guide](vendor/zdraw/README.md#build-and-test)
+utilities. See [the vendored build guide](vendor/zdraw/docs/building.md)
 for public-source setup. The application integration requires a matching built
 shell; the module's standalone guide can also build an extracted release.
+If you built an older zdraw before updating the submodule, run
+`make -C vendor/zdraw clean` before rebuilding.
 
 Startup selects the locally built module only when its recorded Zsh version,
 patch level, platform and host match. It never builds at startup or changes the
@@ -123,7 +253,7 @@ are set, `ZCHAT_DRAW` takes precedence.
 | Environment variable | Default | Override |
 | :--- | :--- | :--- |
 | `ZCHAT_DRAW` | `auto` | `stock` uses the installed module |
-| `ZCHAT_COLOR` | `auto` | `basic` or `mono` selects a simpler palette |
+| `ZCHAT_COLOR` | `auto` | `basic` uses ANSI colors and `mono` disables color. `auto` respects `NO_COLOR`. |
 | `ZCHAT_BORDERS` | `auto` | `plain` uses standard curses borders |
 | `ZCHAT_SPANS` | `true` | `false` uses individual drawing calls |
 | `ZCHAT_SYNC_OUTPUT` | `auto` | `false` disables synchronized frames; `true` forces them |
@@ -185,22 +315,22 @@ brew install zsh
 
 ### 2. Terminal Markdown & Syntax Engine
 * **Headings**: `# H1` (bold magenta), `## H2` (cyan), `### H3` (yellow), `#### H4` (white).
-* **Fenced Code Blocks**: Language badges (`┌──   [python] ──`), line numbers, comment highlighting, and clean box borders.
+* **Fenced Code Blocks**: Language labels, line numbers, muted comments, and wrapped long lines.
 * **Unicode Tables**: Automatically converts standard Markdown tables (`| Col 1 | Col 2 |`) into clean Unicode box tables (`┌─┬─┐`, `│ │ │`, `├─┼─┤`, `└─┴─┘`).
 * **Lists & Hanging Indents**: Bullet lists (`•`), numbered lists (`1.`), and checkboxes (`☐ Todo` / `☑ Done`) wrapped cleanly with hanging indents.
 * **Blockquotes**: Single (`>`) and nested (`>>`) blockquotes styled with vertical accent bars (`▎`).
 * **Inline Spans**: Multi-span rendering for `**bold**`, `*italic*`, `` `inline_code` ``, `~~strikethrough~~`, and `[links](url)`.
 
 ### 3. Multi-Pane Responsive TUI
-* **Header Bar**: Displays active model, Ollama endpoint, and animated status badges (`[ Thinking ⠋ ]`, `[ Streaming ⠋ ]`, `[ Ready ]`).
+* **Header Bar**: Shows the active model, backend, and live status. The Ollama endpoint appears when space permits.
 * **Sidebar Toggle (`Ctrl+B` / `/sidebar`)**: Hide the sessions pane for more reading space; the choice persists across launches. Narrow terminals still hide it automatically.
 * **Slash Suggestions**: Type `/` to discover chat commands. Use Up/Down to select, Tab or Enter to complete, then Enter to run. Escape closes suggestions.
-* **Sidebar Pane**: Lists saved chat sessions with the active conversation highlighted.
+* **Sidebar Pane**: Lists saved chats and keeps the active conversation visible as you browse.
 * **Chat Viewport**: Scrollable message transcript with automatic viewport scrolling during generation.
 * **Stable Transcript Copy (`Ctrl+Y` / `/copy`)**: Temporarily leaves curses and prints the visible transcript as plain text for reliable native terminal selection and copying. Expanded reasoning is included; collapsed reasoning stays hidden.
 * **Incremental Rendering**: Finalized messages are cached while only newly appended stream bytes and the active response are processed; terminal windows refresh as one frame.
 * **Multiline Prompt Editor**: A one-to-four-row cursor-following viewport with soft wrapping, hard newlines via `Shift+Enter` or `Alt+Enter`, vertical cursor movement, draft-preserving prompt history, and safe bracketed multiline paste.
-* **Footer Bar**: A quiet row of essential shortcuts; `Ctrl+H` opens the full reference.
+* **Footer Bar**: Shortcuts change with focus and while a response streams. Help and Quit stay visible at the minimum supported size.
 * **Dynamic Sizing**: Polls terminal geometry, hides the sidebar on narrow terminals, and shows a resize hint below 32 columns or 12 rows. Open pickers close on resize so their windows cannot remain off-screen.
 
 ### 4. Session Persistence & Sidebar History

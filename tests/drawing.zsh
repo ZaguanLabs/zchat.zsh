@@ -22,6 +22,7 @@ drawing_wait() {
 }
 drawing_run() {
   trap - EXIT INT TERM
+  unset NO_COLOR
   export TERM=$drawing_term ZCHAT_COLOR=$drawing_policy ZCHAT_SPANS=true ZCHAT_BORDERS=auto
   exec zsh -df "$TEST_DIR/fixtures/drawing_ui.zsh" "$PROJECT_DIR" "$drawing_base" "$drawing_backend"
 }
@@ -60,6 +61,7 @@ for drawing_backend in "${drawing_backends[@]}"; do
     assert_eq 1 "${mapfile[$drawing_base.safe]:-}" "$drawing_backend/$drawing_policy sanitizes text before drawing"
     assert_eq 1 "${mapfile[$drawing_base.modal]:-}" "$drawing_backend/$drawing_policy clips modal titles and closes overlays on resize"
     assert_eq 1 "${mapfile[$drawing_base.resize]:-}" "$drawing_backend/$drawing_policy resizes narrow, tiny and restored windows"
+    assert_eq 1 "${mapfile[$drawing_base.layout]:-}" "$drawing_backend/$drawing_policy keeps the selected session and narrow shortcuts visible"
     assert_eq 0 "${mapfile[$drawing_base.exit]:-}" "$drawing_backend/$drawing_policy exits cleanly"
     zpty -d drawing-ui
   done

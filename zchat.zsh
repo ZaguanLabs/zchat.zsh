@@ -9,7 +9,7 @@ emulate -R zsh
 setopt EXTENDED_GLOB NO_NOMATCH NO_MONITOR NO_NOTIFY NO_CHECK_JOBS NO_HUP 2>/dev/null
 
 typeset -gr ZCHAT_NAME="zchat.zsh"
-typeset -gr ZCHAT_VERSION="1.0.11"
+typeset -gr ZCHAT_VERSION="1.0.12"
 typeset -gr ZCHAT_DEFAULT_OLLAMA_HOST="localhost:11434"
 typeset -g ZCHAT_HOST_OVERRIDE=0
 typeset -g ZCHAT_MODEL_OVERRIDE=0
@@ -147,7 +147,7 @@ zchat_draw_load && zmodload zsh/datetime zsh/files zsh/net/tcp \
 
 # Compaction owns state persisted by state.zsh, so it is part of the core load
 # rather than a late feature module. Modals are the only mode-gated library.
-zchat_require util json api compact state render input ui || exit 1
+zchat_require util json api compact state remote render input ui || exit 1
 
 # Environment-provided OLLAMA_HOST must cross the same validation boundary as
 # CLI and persisted values before it can become an HTTP Host header.
@@ -209,6 +209,10 @@ main() {
     print -u2 -r -- "Error: ${STATE_ERROR:-could not initialize ${ZCHAT_CONFIG_DIR}}"
     return 1
   fi
+  if ! remote_load_config; then
+    print -u2 -r -- "Error: $REMOTE_ERROR"
+    return 1
+  fi
   input_init
 
   ui_init 0 || {
@@ -260,7 +264,7 @@ main() {
             prompt_tokens=0
             output_tokens=0
           fi
-          chat_record_response_usage "$STREAM_PAYLOAD" "$prompt_tokens" "$output_tokens"
+          backend_record_response_usage "$STREAM_PAYLOAD" "$prompt_tokens" "$output_tokens"
           if state_set_last_assistant_message "$STREAM_LAST_CONTENT" "$STREAM_LAST_THINKING"; then
             UI_STATUS_TEXT="Ready"
           else
@@ -616,7 +620,7 @@ main() {
               else
                 UI_STATUS_TEXT="Compacting"
                 ui_refresh_all 0
-                if chat_compact_history manual; then
+                if backend_compact_history manual; then
                   UI_STATUS_TEXT="Ready"
                 elif (( CHAT_COMPACTION_CANCELLED )); then
                   state_append_message "system" "⏹ Compaction stopped."
@@ -632,7 +636,7 @@ main() {
               ui_refresh_all 0
               ;;
             /context)
-              chat_context_summary
+              backend_context_summary
               state_append_message "system" "$REPLY"
               ui_refresh_all 0
               ;;
@@ -656,7 +660,7 @@ main() {
               # 2. Compact when needed and build the bounded model payload.
               UI_STATUS_TEXT="Preparing"
               ui_refresh_all 0
-              if ! chat_prepare_payload; then
+              if ! backend_prepare_payload; then
                 state_append_message "system" "Could not prepare the conversation: ${CHAT_COMPACTION_ERROR:-unknown compaction error}"
                 UI_STATUS_TEXT="Error"
                 ui_refresh_all 0
@@ -673,7 +677,7 @@ main() {
               ui_refresh_all 1
 
               # 4. Start background streaming
-              if api_start_stream "$OLLAMA_HOST" "$payload" "$STREAM_BASE_FILE" \
+              if backend_start_stream "$OLLAMA_HOST" "$payload" "$STREAM_BASE_FILE" \
                 && api_stream_open_readers "$STREAM_BASE_FILE"; then
                 STREAM_PID="$API_STREAM_PID"
                 STREAM_PAYLOAD="$payload"

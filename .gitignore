@@ -2,3 +2,6 @@
 .atlas/
 # Precompiled Zsh wordcode from `make compile`
 *.zwc
+
+# Bit Lantern local data
+.bitlantern/

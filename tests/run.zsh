@@ -601,20 +601,26 @@ rendered_text="${(j:\n:)RENDERED_LINES}"
 assert_contains "$rendered_text" "streaming two" "stream render cache refreshes the active response"
 [[ "$rendered_text" != *"streaming one"* ]] && pass "stream render cache does not retain stale content" || fail "stream render cache does not retain stale content"
 
+MSG_CONTENTS[2]=$'```txt\nThe start of a long line has room for a final marker END\n```'
+render_messages 32 0
+rendered_text="${(j:\n:)RENDERED_LINES}"
+assert_contains "$rendered_text" '  │     final marker END' 'long fenced lines keep text beyond the first screen row'
+
 MOCK_DRAW_CALLS=()
 SIDE_W=20
 ui_refresh_all 0
 render_calls="${(j:\n:)MOCK_DRAW_CALLS}"
-assert_contains "$render_calls" "refresh top_win side_win chat_win input_win foot_win" "full refresh batches all curses windows"
+assert_contains "$render_calls" "refresh top_win side_win chat_win foot_win input_win" "full refresh batches all windows and ends on the prompt cursor"
 
 MOCK_DRAW_CALLS=()
 ui_refresh_stream
 render_calls="${(j:\n:)MOCK_DRAW_CALLS}"
-assert_contains "$render_calls" "refresh top_win chat_win" "stream refresh repaints only changing windows"
+assert_contains "$render_calls" "refresh top_win chat_win input_win" "stream refresh keeps the prompt cursor"
+assert_not_contains "$render_calls" "clear input_win" "stream refresh leaves the prompt cells intact"
 
 typeset hostile_option_version
 hostile_option_version="$(zsh -f -o KSH_ARRAYS "${PROJECT_DIR}/zchat.zsh" --version)"
-assert_eq "zchat.zsh v${ZCHAT_VERSION:-1.0.11}" "$hostile_option_version" "entrypoint resets hostile ambient Zsh options"
+assert_eq "zchat.zsh v${ZCHAT_VERSION:-1.0.12}" "$hostile_option_version" "entrypoint resets hostile ambient Zsh options"
 if zsh -f "${PROJECT_DIR}/zchat.zsh" --model >/dev/null 2>&1; then fail "CLI rejects missing option values"; else pass "CLI rejects missing option values"; fi
 if zsh -f "${PROJECT_DIR}/zchat.zsh" --unknown >/dev/null 2>&1; then fail "CLI rejects unknown options"; else pass "CLI rejects unknown options"; fi
 

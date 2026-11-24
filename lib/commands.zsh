@@ -80,23 +80,23 @@ ui_slash_input() {
 ui_slash_draw() {
   emulate -L zsh
   (( UI_SLASH_ROWS > 0 )) || return 0
-  local -i capacity=$(( UI_SLASH_ROWS - 1 )) first=1 row i
-  local text=''
+  local -i capacity=$(( UI_SLASH_ROWS - 1 )) first=1 row i y width=$(( SCREEN_W - 4 ))
+  local marker style
   (( UI_SLASH_SELECTED > capacity )) && first=$(( UI_SLASH_SELECTED - capacity + 1 ))
-  zchat_draw move input_win $(( INPUT_VISIBLE_ROWS + 1 )) 2
-  ui_attr input_win dim cyan/black
-  zchat_clip "↑/↓ Select · Tab/Enter Complete · Esc Close · $UI_SLASH_SELECTED/${#UI_SLASH_TEXTS}" $(( SCREEN_W - 4 ))
-  zchat_draw string input_win "$REPLY"
+  local legend='↑/↓ Select  Tab Complete  Esc Close'
+  (( width < ${#legend} )) && legend='↑/↓ Select  Tab  Esc'
+  ui_draw_row input_win $(( INPUT_VISIBLE_ROWS + 1 )) 2 "$width" 'muted/editor' "$legend"
   for (( row=0; row<capacity; row++ )); do
     i=$(( first + row ))
-    text="  ${UI_SLASH_TEXTS[i]} · ${UI_SLASH_LABELS[i]}"
+    y=$(( INPUT_VISIBLE_ROWS + 2 + row ))
+    marker='  '
+    style='text/editor'
     if (( i == UI_SLASH_SELECTED )); then
-      text="› ${UI_SLASH_TEXTS[i]} · ${UI_SLASH_LABELS[i]}"
-      ui_attr input_win -dim bold accent/surface
-    else
-      ui_attr input_win -dim -bold white/black
+      marker='› '
+      style='bold text/selection'
+      [[ $UI_COLOR_MODE == mono || $UI_COLOR_MODE == basic ]] && style='reverse bold text/editor'
+      ui_fill input_win "$y" 2 1 "$width" "$style" ' '
     fi
-    zchat_draw move input_win $(( INPUT_VISIBLE_ROWS + 2 + row )) 2
-    zchat_clip "$text" $(( SCREEN_W - 4 )); zchat_draw string input_win "$REPLY"
+    ui_draw_row input_win "$y" 2 "$width" "$style" "$marker${UI_SLASH_TEXTS[i]}  ${UI_SLASH_LABELS[i]}"
   done
 }

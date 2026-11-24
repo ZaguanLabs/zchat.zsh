@@ -8,7 +8,7 @@ source "${${(%):-%x}:A:h}/commands.zsh"
 # Terminal Dimensions and Layout Metrics
 typeset -g SCREEN_H=24
 typeset -g SCREEN_W=80
-typeset -g TOP_H=3
+typeset -g TOP_H=2
 typeset -g SIDE_W=24
 typeset -g INPUT_H=4
 typeset -g FOOT_H=1
@@ -68,13 +68,11 @@ ui_setup_windows() {
   if (( UI_SIDEBAR_HIDDEN || SCREEN_W < 75 )); then
     SIDE_W=0
   elif (( SCREEN_W < 100 )); then
-    SIDE_W=20
+    SIDE_W=22
   else
-    SIDE_W=24
+    SIDE_W=26
   fi
 
-  TOP_H=3
-  FOOT_H=1
   ui_calculate_input_height
 
   local main_h=$(( SCREEN_H - TOP_H - FOOT_H - INPUT_H ))
@@ -95,9 +93,11 @@ ui_setup_windows() {
   zchat_draw addwin chat_win $main_h $chat_w $TOP_H $chat_x 2>/dev/null
   zchat_draw addwin input_win $INPUT_H $SCREEN_W $input_y 0 2>/dev/null
   zchat_draw addwin foot_win $FOOT_H $SCREEN_W $foot_y 0 2>/dev/null
-  local window
-  for window in top_win chat_win input_win foot_win; do ui_window_background "$window"; done
-  (( SIDE_W > 0 )) && ui_window_background side_win
+  ui_window_background top_win chrome
+  ui_window_background chat_win
+  ui_window_background input_win editor
+  ui_window_background foot_win chrome
+  (( SIDE_W > 0 )) && ui_window_background side_win rail
   (( SIDE_W == 0 )) && [[ "$FOCUS_PANE" == sidebar ]] && FOCUS_PANE=input
   return 0
 }
@@ -137,7 +137,7 @@ ui_resize_windows() {
   zchat_draw resize "$new_h" "$new_w" endwin 2>/dev/null || return 1
 
   ui_setup_windows
-  ui_refresh_all 0
+  ui_refresh_all
 }
 
 # Keep non-streaming Ollama metadata and checkpoint requests cancellable. Other
@@ -284,23 +284,47 @@ ui_copy_view() {
 ui_draw_header() {
   (( UI_SMALL_SCREEN )) && return 0
   local -i defer_refresh="${1:-0}"
-  local stat_val="$UI_STATUS_TEXT" badge identity badge_style=success/surface
-  zchat_terminal_safe "$stat_val"
-  zchat_clip "$REPLY" $(( SCREEN_W / 2 - 6 ))
+  local REPLY badge badge_style='bold success/chrome' backend=Ollama endpoint="$OLLAMA_HOST"
+  local title model brand=" ${ZCHAT_NAME} v${ZCHAT_VERSION} "
+  local -i current=${SESSION_IDS[(Ie)$CURRENT_SESSION_ID]} badge_x model_width
+  local -i badge_limit=$(( SCREEN_W / 2 - 4 ))
+  local -i badge_space=$(( SCREEN_W - ${#brand} - 8 ))
+  local brand_style='bold ink/accent'
+  [[ $UI_COLOR_MODE == mono || $UI_COLOR_MODE == basic ]] && brand_style='reverse bold accent/chrome'
+  (( badge_space < badge_limit )) && badge_limit=$badge_space
+  ui_clip_label "$UI_STATUS_TEXT" "$badge_limit"
   badge="[ $REPLY ]"
-  local -i status_x=$(( SCREEN_W - ${(m)#badge} - 2 ))
-  identity="${ZCHAT_NAME} · ${SESSION_MODEL} (${OLLAMA_HOST})"
-  case "$stat_val" in
-    *Error*|*Stopped*) badge_style=error/surface ;;
-    *Thinking*|*Streaming*|*Generating*|*Compacting*) badge_style=accent/surface ;;
+  badge_x=$(( SCREEN_W - ${(m)#badge} - 2 ))
+  case "$UI_STATUS_TEXT" in
+    *[Ee]rror*|*failed*) badge_style='bold error/chrome' ;;
+    *Stopped*|*Wait*) badge_style='bold warning/chrome' ;;
+    *Thinking*|*Streaming*|*Generating*|*Compacting*|*Loading*|*Preparing*) badge_style='bold accent/chrome' ;;
   esac
-  zchat_draw clear top_win
-  ui_attr top_win -dim -bold border/surface
-  ui_border top_win
-  ui_draw_row top_win 1 2 $(( status_x - 3 )) 'text/surface' "$identity"
-  ui_draw_row top_win 1 "$status_x" $(( SCREEN_W - status_x - 1 )) "$badge_style" "$badge"
+  if (( $+functions[remote_selected] )) && remote_selected; then
+    backend=Remote
+    endpoint=''
+  fi
 
-  (( defer_refresh )) || terminal_refresh top_win
+  zchat_draw clear top_win
+  if (( current && SIDE_W == 0 && badge_x > ${#brand} + 8 )); then
+    ui_clip_label "${SESSION_TITLES[current]}" $(( badge_x - ${#brand} - 6 ))
+    title="  $REPLY"
+  fi
+  ui_draw_row top_win 0 2 $(( badge_x - 2 )) "$brand_style" "$brand" 'text/chrome' "$title"
+  ui_draw_row top_win 0 "$badge_x" $(( SCREEN_W - badge_x - 1 )) "$badge_style" "$badge"
+
+  model_width=$(( SCREEN_W - ${#backend} - 6 ))
+  ui_clip_label "$SESSION_MODEL" "$model_width"
+  model=$REPLY
+  if (( ${#endpoint} && ${(m)#model} + ${(m)#endpoint} + 5 <= model_width )); then
+    endpoint="  ·  $endpoint"
+  else
+    endpoint=''
+  fi
+  ui_draw_row top_win 1 2 $(( SCREEN_W - 4 )) 'muted/chrome' "$backend  " \
+    'bold text/chrome' "$model" 'muted/chrome' "$endpoint"
+
+  (( defer_refresh )) || terminal_refresh top_win input_win
 }
 
 # Render the Sidebar
@@ -309,55 +333,32 @@ ui_draw_sidebar() {
   (( SIDE_W <= 0 )) && return
   local -i defer_refresh="${1:-0}"
 
-  local inner_h=$(( SCREEN_H - 3 - INPUT_H - 1 - 2 ))
-  local inner_w=$(( SIDE_W - 2 ))
-  local total=${#SESSION_IDS}
-  local row=1 i=1 is_curr=0
-  local s_id="" s_title="" display_txt="" line_fmt=""
+  local -i height=$(( SCREEN_H - TOP_H - INPUT_H - FOOT_H )) width=$(( SIDE_W - 3 ))
+  local -i total=${#SESSION_IDS} current=${SESSION_IDS[(Ie)$CURRENT_SESSION_ID]}
+  local -i row=2 i first=1 last=$(( height - 1 ))
+  local title_style='bold text/rail' selected_style='bold text/selection' REPLY
+  local rule='│' marker='›'
+  [[ $UI_BORDER_MODE == plain ]] && rule='|' marker='>'
+  [[ $FOCUS_PANE == sidebar ]] && title_style='reverse bold accent/rail'
+  [[ $UI_COLOR_MODE == mono || $UI_COLOR_MODE == basic ]] && selected_style='reverse bold text/rail'
 
   zchat_draw clear side_win
-  if [[ "$FOCUS_PANE" == "sidebar" ]]; then
-    ui_attr side_win -dim bold accent/surface
-  else
-    ui_attr side_win -dim -bold border/surface
+  ui_fill side_win 0 $(( SIDE_W - 1 )) "$height" 1 border/rail "$rule"
+  ui_draw_row side_win 0 2 $(( width - 1 )) "$title_style" ' Sessions ' 'muted/rail' "$total"
+  if (( height >= 8 )); then
+    last=$(( height - 3 ))
+    ui_draw_row side_win $(( height - 1 )) 2 $(( width - 1 )) 'muted/rail' '^B Hide sessions'
   fi
-  ui_border side_win
-  zchat_draw move side_win 0 2
-  ui_attr side_win bold white/black
-  zchat_curses_string side_win " Sessions (${#SESSION_IDS}) "
-
-  for (( i=1; i<=total && row<=inner_h; i++ )); do
-    s_id="${SESSION_IDS[i]}"
-    s_title="${SESSION_TITLES[i]:-Untitled}"
-    is_curr=0
-    [[ "$s_id" == "$CURRENT_SESSION_ID" ]] && is_curr=1
-
-    zchat_draw move side_win $row 1
-    zchat_terminal_safe "$s_title"
-    zchat_clip "$REPLY" $(( inner_w - 4 )); display_txt="$REPLY"
-
-    if (( is_curr )); then
-      ui_attr side_win bold green/black
-      zchat_pad_right "$display_txt" $(( inner_w - 4 ))
-      line_fmt=" ▶ $REPLY"
-      zchat_curses_string side_win "$line_fmt"
+  (( current > last - row + 1 )) && first=$(( current - (last - row) ))
+  for (( i=first; i<=total && row<=last; i++, row++ )); do
+    ui_clip_label "${SESSION_TITLES[i]:-Untitled}" $(( width - 3 ))
+    if (( i == current )); then
+      ui_fill side_win "$row" 1 1 "$width" "$selected_style" ' '
+      ui_draw_row side_win "$row" 1 "$width" "$selected_style" " $marker $REPLY"
     else
-      ui_attr side_win dim white/black
-      zchat_pad_right "$display_txt" $(( inner_w - 4 ))
-      line_fmt="   $REPLY"
-      zchat_curses_string side_win "$line_fmt"
+      ui_draw_row side_win "$row" 1 "$width" 'text/rail' "   $REPLY"
     fi
-    (( row++ ))
   done
-
-  # Bottom helper info in sidebar
-  if (( inner_h - row >= 3 )); then
-    zchat_draw move side_win $(( inner_h - 2 )) 1
-    ui_attr side_win dim cyan/black
-    zchat_curses_string side_win " ^N: New Chat"
-    zchat_draw move side_win $(( inner_h - 1 )) 1
-    zchat_curses_string side_win " ^O: Models"
-  fi
 
   (( defer_refresh )) || terminal_refresh side_win
 }
@@ -367,38 +368,32 @@ ui_draw_chat() {
   (( UI_SMALL_SCREEN )) && return 0
   local is_stream="${1:-0}"
   local -i defer_refresh="${2:-0}"
-  local chat_inner_w=$(( SCREEN_W - SIDE_W - 2 ))
-  local chat_inner_h=$(( SCREEN_H - 3 - INPUT_H - 1 - 2 ))
+  local -i chat_width=$(( SCREEN_W - SIDE_W ))
+  local -i chat_inner_w=$(( chat_width - 4 )) content_x=2
+  local -i chat_inner_h=$(( SCREEN_H - TOP_H - INPUT_H - FOOT_H - 1 ))
+  (( chat_inner_w > 94 )) && chat_inner_w=94
 
   render_messages $chat_inner_w $is_stream
 
-  zchat_draw clear chat_win
-  if [[ "$FOCUS_PANE" == "chat" ]]; then
-    ui_attr chat_win -dim bold accent/surface
-  else
-    ui_attr chat_win -dim -bold border/surface
-  fi
-  ui_border chat_win
-
-  zchat_draw move chat_win 0 2
-  ui_attr chat_win bold cyan/black
-  zchat_curses_string chat_win " Chat Transcript (${#MSG_ROLES} msgs) "
-
   local total_lines=${#RENDERED_LINES}
+  local -i max_scroll=$(( total_lines > chat_inner_h ? total_lines - chat_inner_h : 0 ))
+  (( CHAT_AUTO_SCROLL || CHAT_SCROLL_OFFSET > max_scroll )) && CHAT_SCROLL_OFFSET=$max_scroll
+  (( CHAT_SCROLL_OFFSET < 0 )) && CHAT_SCROLL_OFFSET=0
 
-  # Manage scroll offset
-  if (( CHAT_AUTO_SCROLL )); then
-    if (( total_lines > chat_inner_h )); then
-      CHAT_SCROLL_OFFSET=$(( total_lines - chat_inner_h ))
-    else
-      CHAT_SCROLL_OFFSET=0
-    fi
-  else
-    if (( CHAT_SCROLL_OFFSET > total_lines - chat_inner_h )); then
-      CHAT_SCROLL_OFFSET=$(( total_lines - chat_inner_h ))
-    fi
-    (( CHAT_SCROLL_OFFSET < 0 )) && CHAT_SCROLL_OFFSET=0
+  local title_style='bold text/surface' trail='' rule='─'
+  [[ $UI_BORDER_MODE == plain ]] && rule='-'
+  [[ $FOCUS_PANE == chat ]] && title_style='reverse bold accent/surface'
+  if (( CHAT_SCROLL_OFFSET < max_scroll )); then
+    trail=' PgDn Newer '
+  elif (( max_scroll > 0 )); then
+    trail=' PgUp History '
   fi
+  zchat_draw clear chat_win
+  ui_fill chat_win 0 1 1 $(( chat_width - 2 )) border/surface "$rule"
+  ui_draw_row chat_win 0 "$content_x" $(( chat_inner_w - ${#trail} )) \
+    "$title_style" ' Conversation ' 'muted/surface' "${#MSG_ROLES} "
+  [[ -n $trail ]] && ui_draw_row chat_win 0 $(( chat_width - ${#trail} - 2 ))  \
+    "${#trail}" 'muted/surface' "$trail"
 
   local -i row idx span_index
   local line_str attr_str span_str
@@ -417,21 +412,10 @@ ui_draw_chat() {
     else
       spans=("$attr_str" "$line_str")
     fi
-    ui_draw_row chat_win "$row" 1 "$chat_inner_w" "${spans[@]}"
+    ui_draw_row chat_win "$row" "$content_x" "$chat_inner_w" "${spans[@]}"
   done
 
-  # Scroll indicator badge
-  if (( total_lines > chat_inner_h && CHAT_SCROLL_OFFSET < total_lines - chat_inner_h )); then
-    zchat_draw move chat_win 0 $(( chat_inner_w - 18 ))
-    ui_attr chat_win -dim bold accent/surface
-    zchat_curses_string chat_win " [▼ Scroll: PgDn] "
-  elif (( CHAT_SCROLL_OFFSET > 0 )); then
-    zchat_draw move chat_win 0 $(( chat_inner_w - 18 ))
-    ui_attr chat_win dim white/black
-    zchat_curses_string chat_win " [▲ Scrolled Up] "
-  fi
-
-  (( defer_refresh )) || terminal_refresh chat_win
+  (( defer_refresh )) || terminal_refresh chat_win input_win
 }
 
 # Render the multiline, cursor-following prompt editor.
@@ -439,26 +423,26 @@ ui_draw_input() {
   (( UI_SMALL_SCREEN )) && return 0
   local -i defer_refresh="${1:-0}"
   local -i max_rows=$(( INPUT_H - 2 - UI_SLASH_ROWS )) row visual_row cursor_y cursor_x total
-  local visible="" marker="" title=" Message "
+  local visible='' marker='' title=' Message ' title_style='bold text/editor'
+  local marker_style='muted/editor' body_style border_style='border/editor'
 
   ui_input_width
   input_layout "$REPLY" "$max_rows"
   total=${#INPUT_VISUAL_LINES}
 
   zchat_draw clear input_win
-  if [[ "$FOCUS_PANE" == "input" ]]; then
-    ui_attr input_win -dim bold accent/surface
-  else
-    ui_attr input_win -dim -bold border/surface
+  if [[ "$FOCUS_PANE" == input ]]; then
+    border_style='accent/editor'
+    marker_style='bold accent/editor'
+    title_style='reverse bold accent/editor'
   fi
+  ui_attr input_win -reverse -dim -bold "$border_style"
   ui_border input_win
 
-  zchat_draw move input_win 0 2
-  ui_attr input_win bold white/black
   if (( total > INPUT_VISIBLE_ROWS )); then
     title=" Message (${INPUT_VIEW_TOP}-$(( INPUT_VIEW_TOP + INPUT_VISIBLE_ROWS - 1 ))/${total}) "
   fi
-  zchat_curses_string input_win "${title[1,$(( SCREEN_W - 4 ))]}"
+  ui_draw_row input_win 0 2 $(( SCREEN_W - 4 )) "$title_style" "$title"
 
   for (( row=1; row<=INPUT_VISIBLE_ROWS; row++ )); do
     visual_row=$(( INPUT_VIEW_TOP + row - 1 ))
@@ -467,11 +451,13 @@ ui_draw_input() {
     (( visual_row == 1 )) && marker="❯"
     (( row == 1 && INPUT_VIEW_TOP > 1 )) && marker="↑"
     (( row == INPUT_VISIBLE_ROWS && visual_row < total )) && marker="↓"
-    zchat_draw move input_win $row 2
-    ui_attr input_win -dim bold accent/surface
-    zchat_curses_string input_win "$marker "
-    ui_attr input_win white/black
-    zchat_curses_string input_win "$visible"
+    body_style='text/editor'
+    if [[ -z $INPUT_BUF ]]; then
+      visible='Type a message or / for commands'
+      (( SCREEN_W < 40 )) && visible='Type a message or /'
+      body_style='muted/editor'
+    fi
+    ui_draw_row input_win "$row" 2 $(( SCREEN_W - 4 )) "$marker_style" "$marker " "$body_style" "$visible"
   done
 
   ui_slash_draw
@@ -494,7 +480,7 @@ ui_input_changed() {
   ui_calculate_input_height
   if (( INPUT_H != previous_height )); then
     ui_setup_windows
-    ui_refresh_all 0
+    ui_refresh_all
   else
     ui_draw_input
   fi
@@ -504,14 +490,32 @@ ui_input_changed() {
 ui_draw_footer() {
   (( UI_SMALL_SCREEN )) && return 0
   local -i defer_refresh="${1:-0}"
-  local bar_str=" Enter Send   Alt+Enter Newline   ^O Model   ^N New   ^H Help   ^Q Quit" padded=""
+  local -a shortcuts spans=()
+  local key label
+  local -i trailing_x=$(( SCREEN_W - 18 )) cells
+  local -i remaining=$(( trailing_x - 4 ))
+  local -i is_streaming=${2:-${STREAM_PID:+1}}
+  if (( is_streaming )); then
+    shortcuts=('^C' ' Stop')
+  else
+    case "$FOCUS_PANE" in
+      input) shortcuts=(Enter ' Send' 'Alt+Enter' ' Newline') ;;
+      sidebar) shortcuts=('↑/↓' ' Switch' Enter ' Compose') ;;
+      chat) shortcuts=('PgUp/Dn' ' Scroll' End ' Latest') ;;
+    esac
+  fi
+  shortcuts+=('^O' ' Model' '^N' ' New' Tab ' Focus')
+  for key label in "${shortcuts[@]}"; do
+    cells=$(( ${(m)#key} + ${#label} ))
+    (( cells <= remaining )) || continue
+    spans+=('bold text/chrome' "$key" 'muted/chrome' "$label  ")
+    (( remaining -= cells + 2 ))
+  done
+
   zchat_draw clear foot_win
-  ui_attr foot_win -reverse -bold muted/surface
-  zchat_pad_right "$bar_str" "$SCREEN_W"
-  padded="$REPLY"
-  zchat_draw move foot_win 0 0
-  zchat_curses_string foot_win "$padded"
-  ui_attr foot_win -reverse default/default
+  (( ${#spans} )) && ui_draw_row foot_win 0 2 $(( trailing_x - 3 )) "${spans[@]}"
+  ui_draw_row foot_win 0 "$trailing_x" 16 'bold text/chrome' '^H' 'muted/chrome' ' Help  ' \
+    'bold text/chrome' '^Q' 'muted/chrome' ' Quit'
   (( defer_refresh )) || terminal_refresh foot_win
 }
 
@@ -539,18 +543,18 @@ ui_refresh_all() {
   fi
   ui_draw_chat "$is_stream" 1
   ui_draw_input 1
-  ui_draw_footer 1
-  windows+=(chat_win input_win foot_win)
+  ui_draw_footer 1 "$is_stream"
+  # Curses takes the physical cursor from the last presented window.
+  windows+=(chat_win foot_win input_win)
   terminal_refresh "${windows[@]}"
 }
 
-# Streaming changes only the status badge and transcript. Avoid repainting the
-# sidebar, prompt, and footer for every visual frame.
+# Paint only the changing windows, then use the prompt's saved cursor position.
 ui_refresh_stream() {
   (( UI_SMALL_SCREEN )) && return 0
   ui_draw_header 1
   ui_draw_chat 1 1
-  terminal_refresh top_win chat_win
+  terminal_refresh top_win chat_win input_win
 }
 
 ui_toggle_sidebar() {

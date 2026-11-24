@@ -1,0 +1,37 @@
+{
+  "models": {
+    "my-chat": {
+      "protocol": "chat-completions",
+      "url": "https://your-provider.example/v1/chat/completions",
+      "model": "your-model-id",
+      "auth": "bearer",
+      "api_key_env": "CHAT_API_KEY",
+      "context_window": 65536,
+      "max_output_tokens": 4096,
+      "token_field": "max_tokens",
+      "parameters": {
+        "stream_options": { "include_usage": true }
+      }
+    },
+    "my-responses": {
+      "protocol": "responses",
+      "url": "https://your-provider.example/v1/responses",
+      "model": "your-model-id",
+      "auth": "bearer",
+      "api_key_env": "RESPONSES_API_KEY",
+      "context_window": 65536,
+      "max_output_tokens": 4096,
+      "parameters": { "store": false }
+    },
+    "my-messages": {
+      "protocol": "messages",
+      "url": "https://your-provider.example/v1/messages",
+      "model": "your-model-id",
+      "auth": "api-key",
+      "api_key_env": "MESSAGES_API_KEY",
+      "context_window": 65536,
+      "max_output_tokens": 4096,
+      "headers": { "anthropic-version": "2023-06-01" }
+    }
+  }
+}

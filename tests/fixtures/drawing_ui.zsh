@@ -16,7 +16,7 @@ zmodload zsh/terminfo zsh/datetime zsh/mapfile || exit 1
 for fixture_lib in util json render input ui modal; do
   source "$fixture_root/lib/$fixture_lib.zsh"
 done
-typeset -g ZCHAT_NAME=zchat.zsh ZCHAT_VERSION=preview SESSION_MODEL=gemma4:12b
+typeset -g ZCHAT_NAME=zchat.zsh ZCHAT_VERSION=1.2.30 SESSION_MODEL=gemma4:12b
 typeset -g OLLAMA_HOST=localhost:11434 CURRENT_SESSION_ID=preview
 typeset -a SESSION_IDS=(preview earlier) SESSION_TITLES=('A quiet conversation' 'Weekend plans')
 typeset -a MSG_ROLES=(user assistant) MSG_CONTENTS=(
@@ -30,6 +30,8 @@ ui_init || exit 1
 mapfile[$fixture_base.mode]="$UI_COLOR_MODE:$UI_BORDER_MODE:$UI_STYLED_SPANS"
 mapfile[$fixture_base.rgb]="${UI_COLOR_INFO[truecolor_supported]:-0}"
 mapfile[$fixture_base.clipping]="$UI_CLIPPED_SPANS"
+NO_COLOR=1 ZCHAT_COLOR=auto ui_theme_init
+[[ $UI_COLOR_MODE == mono ]] || exit 33
 ZCHAT_SPANS=false ui_theme_init
 (( UI_STYLED_SPANS == 0 && UI_CLIPPED_SPANS == 0 )) || exit 13
 mapfile[$fixture_base.spans_disabled]=1
@@ -149,6 +151,17 @@ for window in top_win side_win chat_win input_win foot_win; do
   done
 done
 mapfile[$fixture_base.cells]="$out"
+# A selected session below the first page must stay visible in the rail.
+for ((row=1; row<=40; row++)); do
+  SESSION_IDS+=("older-$row")
+  SESSION_TITLES+=("Earlier conversation $row")
+done
+CURRENT_SESSION_ID=${SESSION_IDS[-1]}
+ui_draw_sidebar 1
+zchat_draw position side_win geometry || exit 34
+zchat_draw move side_win $(( geometry[5] - 3 )) 4
+zchat_draw querychar side_win cell || exit 35
+[[ $cell[1] == E ]] || exit 36
 # A long overlay title must not overwrite its right border, and overlay input
 # must yield when the terminal changes size.
 zchat_draw addwin modal_win 10 36 4 4 || exit 24
@@ -166,7 +179,7 @@ _modal_input
 zchat_draw delwin modal_win
 mapfile[$fixture_base.modal]=1
 # Resize through both implementations, including a terminal too small for panes.
-for fixture_size in '18 60' '6 20' '30 110'; do
+for fixture_size in '18 60' '12 32' '6 20' '30 140' '30 110'; do
   command stty rows ${${=fixture_size}[1]} cols ${${=fixture_size}[2]} </dev/tty || exit 16
   UI_NEXT_RESIZE_CHECK=0
   ui_poll_resize
@@ -177,9 +190,26 @@ for fixture_size in '18 60' '6 20' '30 110'; do
     (( ! UI_SMALL_SCREEN )) || exit 19
     zchat_draw position input_win geometry || exit 20
     (( geometry[3] + geometry[5] <= SCREEN_H )) || exit 21
+    if (( SCREEN_W == 32 )); then
+      zchat_draw move top_win 0 19; zchat_draw querychar top_win cell
+      [[ $cell[1] == 0 ]] || exit 41
+      zchat_draw move foot_win 0 2; zchat_draw querychar foot_win cell
+      [[ $cell[1] == E ]] || exit 40
+      zchat_draw move foot_win 0 15; zchat_draw querychar foot_win cell
+      [[ $cell[1] == H ]] || exit 37
+      zchat_draw move foot_win 0 24; zchat_draw querychar foot_win cell
+      [[ $cell[1] == Q ]] || exit 38
+    elif (( SCREEN_W == 140 )); then
+      zchat_draw move chat_win 0 3; zchat_draw querychar chat_win cell
+      [[ $cell[1] == C ]] || exit 42
+      zchat_draw move chat_win 1 2; zchat_draw querychar chat_win cell
+      [[ $cell[1] == ▎ ]] || exit 43
+    fi
   fi
+  [[ $INPUT_BUF == 'Does the same thing happen at sunrise?' ]] || exit 39
 done
 mapfile[$fixture_base.resize]=1
+mapfile[$fixture_base.layout]=1
 # Read a real key after reconstruction, and restore curses once more as /copy does.
 mapfile[$fixture_base.ready]=1
 typeset -F input_deadline=$(( EPOCHREALTIME + 5 ))

@@ -4,19 +4,29 @@
 _modal_frame() {
   local win="$1"
   local title="$2"
+  local -a geometry=()
 
-  ui_window_background "$win"
+  ui_window_background "$win" editor
   zchat_draw clear "$win"
-  ui_attr "$win" -dim -bold border/surface
+  ui_attr "$win" -reverse -dim -bold accent/editor
   ui_border "$win"
-
-  zchat_draw move "$win" 0 2
-  ui_attr "$win" bold white/black
-  zchat_curses_string "$win" " ${title} "
-  ui_attr "$win" default/default
+  zchat_draw position "$win" geometry || return 1
+  ui_draw_row "$win" 0 2 $(( geometry[6] - 4 )) 'reverse bold accent/editor' " $title "
 }
 
-# Modal 1: Select Ollama Model
+_modal_choice() {
+  local -i row=$1 width=$2 selected=$3
+  local text="$4" style='text/editor' REPLY
+  ui_clip_label "$text" "$width"
+  if (( selected )); then
+    style='bold text/selection'
+    [[ $UI_COLOR_MODE == mono || $UI_COLOR_MODE == basic ]] && style='reverse bold text/editor'
+    ui_fill modal_win "$row" 2 1 "$width" "$style" ' '
+  fi
+  ui_draw_row modal_win "$row" 2 "$width" "$style" "$REPLY"
+}
+
+# Modal 1: Select Model
 modal_select_model() {
   (( UI_SMALL_SCREEN )) && return 0
   local -a models=()
@@ -33,6 +43,7 @@ modal_select_model() {
     fi
   fi
 
+  models+=("${REMOTE_MODELS[@]}")
   local total=${#models}
   if (( total == 0 )); then
     models=("$SESSION_MODEL")
@@ -60,11 +71,11 @@ modal_select_model() {
 
   local max_visible=$(( m_h - 4 ))
   local scroll_top=1
-  local row=2 mod_name="" display_str="" padded=""
+  local row=2 mod_name="" display_str=""
   local ch="" key="" mouse="" cur_ch="" cur_key=""
 
   while true; do
-    _modal_frame modal_win "Select Ollama Model (↑/↓: Nav, Enter: Select, Esc: Cancel)"
+    _modal_frame modal_win 'Select model'
 
     # Adjust scrolling window
     if (( sel < scroll_top )); then
@@ -77,28 +88,12 @@ modal_select_model() {
     for (( i=scroll_top; i<=total && i<scroll_top+max_visible; i++ )); do
       mod_name="${models[i]}"
       display_str="  ${mod_name}"
-      [[ "$mod_name" == "$SESSION_MODEL" ]] && display_str="★ ${mod_name}"
-
-      zchat_draw move modal_win $row 2
-      if (( i == sel )); then
-        ui_attr modal_win reverse bold cyan/black
-        zchat_pad_right "$display_str" $(( m_w - 4 ))
-        padded="$REPLY"
-        zchat_curses_string modal_win "$padded"
-        ui_attr modal_win -reverse default/default
-      else
-        ui_attr modal_win white/black
-        zchat_pad_right "$display_str" $(( m_w - 4 ))
-        padded="$REPLY"
-        zchat_curses_string modal_win "$padded"
-      fi
+      [[ "$mod_name" == "$SESSION_MODEL" ]] && display_str="• ${mod_name}"
+      _modal_choice "$row" $(( m_w - 4 )) $(( i == sel )) "$display_str"
       (( row++ ))
     done
 
-    # Status count at bottom
-    zchat_draw move modal_win $(( m_h - 2 )) 2
-    ui_attr modal_win dim white/black
-    zchat_curses_string modal_win "Model ${sel}/${total}  [Host: ${OLLAMA_HOST}]"
+    ui_draw_row modal_win $(( m_h - 2 )) 2 $(( m_w - 4 )) 'muted/editor' "${sel}/${total}  ↑/↓  Enter  Esc"
 
     terminal_refresh modal_win
 
@@ -156,32 +151,20 @@ modal_system_prompt() {
   zchat_draw addwin modal_win $m_h $m_w $m_y $m_x 2>/dev/null || return
 
   local ch="" key="" mouse="" cur_ch="" cur_key=""
-  local row=2 i=1 p="" padded="" cur_preview=""
+  local row=2 i=1 REPLY
 
   while true; do
-    _modal_frame modal_win "System Prompt Presets (↑/↓: Nav, Enter: Set, Esc: Cancel)"
+    _modal_frame modal_win 'System prompt'
 
     row=2
     for (( i=1; i<=total; i++ )); do
-      zchat_draw move modal_win $row 2
-      p="${presets[i]}"
-      zchat_pad_right "  $p" $(( m_w - 4 ))
-      padded="$REPLY"
-      if (( i == sel )); then
-        ui_attr modal_win reverse bold magenta/black
-        zchat_curses_string modal_win "$padded"
-        ui_attr modal_win -reverse default/default
-      else
-        ui_attr modal_win white/black
-        zchat_curses_string modal_win "$padded"
-      fi
+      _modal_choice "$row" $(( m_w - 4 )) $(( i == sel )) "  ${presets[i]}"
       (( row++ ))
     done
 
-    zchat_draw move modal_win $(( m_h - 3 )) 2
-    ui_attr modal_win dim white/black
-    cur_preview="${SESSION_SYSTEM_PROMPT[1,$(( m_w - 14 ))]}"
-    zchat_curses_string modal_win "Active: \"${cur_preview}...\""
+    ui_clip_label "Active · ${SESSION_SYSTEM_PROMPT}" $(( m_w - 4 ))
+    ui_draw_row modal_win $(( m_h - 3 )) 2 $(( m_w - 4 )) 'muted/editor' "$REPLY"
+    ui_draw_row modal_win $(( m_h - 2 )) 2 $(( m_w - 4 )) 'muted/editor' '↑/↓  Enter  Esc'
 
     terminal_refresh modal_win
 
@@ -234,7 +217,7 @@ modal_show_help() {
     "Ctrl+R        : Toggle Reasoning expand/collapse"
     "Ctrl+Y /copy  : Open plain-text transcript copy view"
     "Ctrl+N        : Start a new chat session"
-    "Ctrl+O        : Open model picker (switch Ollama model)"
+    "Ctrl+O        : Open model picker (switch model)"
     "/host URL     : Change and save the Ollama URL"
     "/compact/context: Checkpoint / show context budget"
     "Ctrl+S        : Change system prompt preset"
@@ -251,17 +234,23 @@ modal_show_help() {
     "Ctrl+Q / ^D   : Quit zchat.zsh"
   )
 
-  local -i row offset=0 capacity=$(( m_h - 3 )) index maximum
+  local -i row offset=0 capacity=$(( m_h - 4 )) index maximum
   local item="" ch="" key="" mouse=""
-  maximum=$(( ${#help_items} - capacity ))
+  local -a help_lines=()
+  for item in "${help_items[@]}"; do
+    zchat_wrap "$item" $(( m_w - 4 ))
+    help_lines+=("${ZCHAT_WRAPPED[@]}")
+  done
+  maximum=$(( ${#help_lines} - capacity ))
   (( maximum < 0 )) && maximum=0
   while true; do
-    _modal_frame modal_win "Help · ↑/↓ Scroll · Esc Close"
+    _modal_frame modal_win 'Keyboard shortcuts'
     for (( row=0; row<capacity; row++ )); do
       index=$(( offset + row + 1 ))
-      (( index <= ${#help_items} )) || break
-      ui_draw_row modal_win $(( row + 2 )) 2 $(( m_w - 4 )) text/surface "${help_items[index]}"
+      (( index <= ${#help_lines} )) || break
+      ui_draw_row modal_win $(( row + 2 )) 2 $(( m_w - 4 )) text/editor "${help_lines[index]}"
     done
+    ui_draw_row modal_win $(( m_h - 2 )) 2 $(( m_w - 4 )) 'muted/editor' '↑/↓ Scroll  Esc Close'
     terminal_refresh modal_win
     ch=''; key=''; mouse=''
     _modal_input

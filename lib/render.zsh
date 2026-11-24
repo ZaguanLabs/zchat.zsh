@@ -166,6 +166,29 @@ _add_line() {
   fi
 }
 
+_add_split_line() {
+  local REPLY first_span
+  _add_line "$2$4" "$1" 0
+  _render_pack_span "$1" "$2"; first_span=$REPLY
+  _render_pack_span "$3" "$4"
+  RENDERED_SPANS[-1]="$first_span$REPLY"
+}
+
+_render_turn_heading() {
+  local title="$1" style="$2" time="$3" REPLY
+  local -i width=$4
+  zchat_terminal_safe "$title"; title=$REPLY
+  zchat_terminal_safe "$time"; time=$REPLY
+  (( ${(m)#time} <= width / 3 )) || time=''
+  [[ -n $time ]] && time="  $time"
+  local -i title_width=$(( width - ${(m)#time} ))
+  if (( ${(m)#title} > title_width )); then
+    zchat_clip "$title" $(( title_width - 1 ))
+    title="$REPLY…"
+  fi
+  _add_split_line "$style" "$title" 'muted/surface' "$time"
+}
+
 # Format markdown table lines into Unicode box drawing
 _render_markdown_table() {
   local -a raw_tbl=("$@")
@@ -272,14 +295,9 @@ _render_message_range() {
   local count=$range_end total_count=${#MSG_ROLES}
   if (( total_count == 0 && reset )); then
     _add_line " " "default/default" 0
-    _add_line "  Welcome to zchat" "bold cyan/black" 0
-    _add_line " " "default/default" 0
-    _add_line "  • Type your message in the bottom input box and press Enter to send." "dim white/black" 0
-    _add_line "  • Ctrl+O selects a model. Ctrl+H opens help." "dim white/black" 0
-    _add_line "  • Press Ctrl+R to expand or collapse Reasoning blocks." "dim white/black" 0
-    _add_line "  • Press Ctrl+N for new chat, Ctrl+S for system prompt presets." "dim white/black" 0
-    _add_line "  • Press Tab to switch focus or PgUp/PgDn to scroll history." "dim white/black" 0
-    _add_line " " "default/default" 0
+    _add_line '  Start a conversation' 'bold accent/surface' 0
+    _add_line '  Ctrl+O  Choose a model' 'muted/surface' 0
+    _add_line '  Ctrl+H  View shortcuts' 'muted/surface' 0
     return
   fi
   (( range_start <= range_end )) || return 0
@@ -288,7 +306,8 @@ _render_message_range() {
   local -a raw_lines=() wrapped=() think_raw=() table_buf=()
   local l="" wl="" in_code=0 code_lang="" in_table=0 line_num=1
   local think_count=0 show_expanded=0 banner_hdr="" pad_w=0 bbar=""
-  local hdr="" pad_len=0 bar="" num_prefix="" code_attr="" rbar=""
+  local hdr="" pad_len=0 bar="" num_prefix="" code_attr="" rbar="" REPLY
+  local -i code_width
   local mark="" t_txt="" num="" num_txt="" first=1 b_txt=""
 
   for (( i=range_start; i<=range_end; i++ )); do
@@ -311,9 +330,9 @@ _render_message_range() {
     case "$role" in
       user)
         [[ -z "$content" ]] && continue
-        _add_line "You  ${tm}" "bold green/black" 0
+        _render_turn_heading '▎ You' 'bold user/surface' "$tm" "$width"
 
-        raw_lines=("${(f)content}")
+        raw_lines=("${(@f)content}")
         for l in "${raw_lines[@]}"; do
           if [[ -z "$l" ]]; then
             _add_line " " "default/default" 0
@@ -321,7 +340,7 @@ _render_message_range() {
             zchat_wrap "$l" "$text_width"
             wrapped=("${ZCHAT_WRAPPED[@]}")
             for wl in "${wrapped[@]}"; do
-              _add_line "  $wl" "green/black" 1
+              _add_line "  $wl" "text/surface" 1
             done
           fi
         done
@@ -329,7 +348,7 @@ _render_message_range() {
         ;;
 
       assistant)
-        _add_line "Assistant (${MSG_MODELS[i]:-$SESSION_MODEL})  ${tm}" "bold cyan/black" 0
+        _render_turn_heading "▎ Assistant (${MSG_MODELS[i]:-$SESSION_MODEL})" 'bold accent/surface' "$tm" "$width"
 
         # ----------------------------------------------------------------------
         # 1. Reasoning Block (Collapsible)
@@ -342,13 +361,12 @@ _render_message_range() {
           bbar="$REPLY"
 
           if [[ -z "$thinking" ]]; then
-            _add_line "  ▼ 💭 Thinking..." "bold magenta/black" 0
-            _add_line "  │ (generating reasoning...)" "dim magenta/black" 0
+            _add_line "  ▾ Thinking…" "bold syntax/surface" 0
             _add_line "  └──${bbar}" "dim magenta/black" 0
           else
             think_raw=("${(f)thinking}")
             think_count=${#think_raw}
-            _add_line "  ▼ 💭 Thinking... (${think_count} lines)" "bold magenta/black" 0
+            _add_line "  ▾ Thinking · ${think_count} lines" "bold syntax/surface" 0
 
             for l in "${think_raw[@]}"; do
               if [[ -z "$l" ]]; then
@@ -370,7 +388,7 @@ _render_message_range() {
           think_count=${#think_raw}
 
           if (( exp == 1 )); then
-            _add_line "  ▼ 💭 Reasoning (${think_count} lines) [Press ^R to collapse]" "bold magenta/black" 0
+            _add_line "  ▾ Reasoning · ^R to collapse" "bold syntax/surface" 0
 
             for l in "${think_raw[@]}"; do
               if [[ -z "$l" ]]; then
@@ -389,7 +407,7 @@ _render_message_range() {
             bbar="$REPLY"
             _add_line "  └──${bbar}" "dim magenta/black" 0
           else
-            _add_line "  ▶ 💭 Reasoning (${think_count} lines) [Press ^R to expand]" "dim magenta/black" 0
+            _add_line "  ▸ Reasoning · ^R to expand" "syntax/surface" 0
           fi
           _add_line " " "default/default" 0
         fi
@@ -398,7 +416,7 @@ _render_message_range() {
         # 2. Main Markdown Content
         # ----------------------------------------------------------------------
         if [[ -n "$content" ]]; then
-          raw_lines=("${(f)content}")
+          raw_lines=("${(@f)content}")
           in_code=0
           code_lang=""
           line_num=1
@@ -423,28 +441,39 @@ _render_message_range() {
                 in_code=1
                 line_num=1
                 code_lang="${match[1]:-code}"
-                hdr="  ┌──   [${code_lang}] "
+                zchat_clip "$code_lang" $(( text_width - 8 ))
+                hdr="  ╭─ ${REPLY} "
                 pad_len=$(( text_width - ${(m)#hdr} ))
                 (( pad_len < 2 )) && pad_len=2
                 zchat_repeat "─" "$pad_len"
                 bar="$REPLY"
-                _add_line "${hdr}${bar}" "bold cyan/black" 0
+                _add_line "${hdr}${bar}" "bold accent/surface" 0
               else
                 in_code=0
-                zchat_repeat "─" "$text_width"
+                zchat_repeat "─" $(( text_width - 5 ))
                 bar="$REPLY"
-                _add_line "  └──${bar}" "dim yellow/black" 0
+                _add_line "  ╰──${bar}" "border/surface" 0
               fi
 
             # Inside code block
             elif (( in_code )); then
               printf -v num_prefix "  │ %2d  " "$line_num"
               (( line_num++ ))
-              code_attr="yellow/black"
+              code_attr="text/surface"
               if [[ "$l" =~ '^[[:space:]]*(#|//|--)' ]]; then
-                code_attr="dim green/black"
+                code_attr="muted/surface"
               fi
-              _add_line "${num_prefix}${l}" "$code_attr" 0
+              zchat_terminal_safe "$l"
+              code_width=$(( text_width - ${#num_prefix} ))
+              if (( ${(m)#REPLY} <= code_width )); then
+                _add_split_line 'muted/surface' "$num_prefix" "$code_attr" "$REPLY"
+              else
+                zchat_hard_wrap "$REPLY" "$code_width"
+                for wl in "${ZCHAT_WRAPPED[@]}"; do
+                  _add_split_line 'muted/surface' "$num_prefix" "$code_attr" "$wl"
+                  num_prefix=${num_prefix//[[:digit:]]/ }
+                done
+              fi
 
             # Outside code block - standard markdown elements
             else
